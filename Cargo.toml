@@ -274,6 +274,7 @@ members = [
     "gix-tui",
     "gix-tix",
     "gix-archive",
+    "gix-upload-pack",
     "gix-worktree-stream",
     "gix-revwalk",
     "gix-fsck",

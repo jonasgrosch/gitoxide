@@ -2510,6 +2510,37 @@ name = "gix-tui"
 version = "0.0.0"
 
 [[package]]
+name = "gix-upload-pack"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bstr",
+ "futures-lite",
+ "gix",
+ "gix-actor",
+ "gix-date",
+ "gix-features",
+ "gix-filter",
+ "gix-hash",
+ "gix-object",
+ "gix-odb",
+ "gix-pack",
+ "gix-packetline",
+ "gix-packetline-blocking",
+ "gix-pathspec",
+ "gix-protocol",
+ "gix-ref",
+ "gix-revision",
+ "gix-transport",
+ "gix-traverse",
+ "serial_test",
+ "smallvec",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "gix-url"
 version = "0.32.0"
 dependencies = [
