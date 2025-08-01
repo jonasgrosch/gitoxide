@@ -39,14 +39,27 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
     
     /// Send a data packet
     pub async fn send_data(&mut self, data: &[u8]) -> Result<()> {
+        // Use consistent chunking size for all modes, matching native Git's ~8KB chunks
+        // This improves compatibility and performance
+        const OPTIMAL_CHUNK_SIZE: usize = 8196;
+        
         match self.side_band_mode {
             SideBandMode::None => {
-                // Send data directly
-                gix_packetline::encode::data_to_write(data, &mut *self.writer).await?;
+                // For large data, chunk it to avoid packet line size limits
+                if data.len() <= OPTIMAL_CHUNK_SIZE {
+                    gix_packetline::encode::data_to_write(data, &mut *self.writer).await?;
+                } else {
+                    // Chunk large data into multiple packet lines
+                    for chunk in data.chunks(OPTIMAL_CHUNK_SIZE) {
+                        gix_packetline::encode::data_to_write(chunk, &mut *self.writer).await?;
+                    }
+                }
             }
             SideBandMode::Basic | SideBandMode::SideBand64k => {
-                // Send with side-band multiplexing
-                self.send_side_band(SideBandChannel::Data, data).await?;
+                // Pack data should be sent via side-band channel 1 (Data channel)
+                // This matches Git's behavior where pack files are multiplexed with progress
+                // Use consistent chunking for better compatibility with native Git
+                self.send_side_band_chunked(SideBandChannel::Data, data, OPTIMAL_CHUNK_SIZE).await?;
             }
         }
         Ok(())
@@ -56,7 +69,7 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
     pub async fn send_progress(&mut self, message: &str) -> Result<()> {
         match self.side_band_mode {
             SideBandMode::None => {
-                // Can't send progress without side-band
+                // Cannot send progress without side-band
             }
             SideBandMode::Basic | SideBandMode::SideBand64k => {
                 let progress_msg = format!("{}\n", message);
@@ -84,14 +97,27 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
     
     /// Send a side-band packet
     async fn send_side_band(&mut self, channel: SideBandChannel, data: &[u8]) -> Result<()> {
-        let max_data_size = match self.side_band_mode {
-            SideBandMode::Basic => 999,  // 1000 - 1 byte for channel
-            SideBandMode::SideBand64k => 65519, // 65520 - 1 byte for channel
-            SideBandMode::None => unreachable!(),
-        };
+        let max_data_size = self.side_band_mode.max_data_size()
+            .expect("send_side_band called when side-band mode is None");
         
         // Split data into chunks if necessary and use gix-packetline encoding
         for chunk in data.chunks(max_data_size) {
+            gix_packetline::encode::band_to_write(channel, chunk, &mut *self.writer).await?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Send a side-band packet with custom chunk size
+    async fn send_side_band_chunked(&mut self, channel: SideBandChannel, data: &[u8], chunk_size: usize) -> Result<()> {
+        let max_data_size = self.side_band_mode.max_data_size()
+            .expect("send_side_band_chunked called when side-band mode is None");
+        
+        // Use the smaller of our preferred chunk size and the protocol maximum
+        let effective_chunk_size = chunk_size.min(max_data_size);
+        
+        // Split data into chunks and use gix-packetline encoding
+        for chunk in data.chunks(effective_chunk_size) {
             gix_packetline::encode::band_to_write(channel, chunk, &mut *self.writer).await?;
         }
         
@@ -146,10 +172,12 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
     
     /// Send a reference line (for ls-refs)
     pub async fn send_ref(&mut self, reference: &Reference) -> Result<()> {
-        let mut line = format!("{} {}", reference.target_oid().to_hex(), reference.ref_name().to_str_lossy());
+        let (ref_name, target_oid, peeled) = reference.unpack();
+        let target_oid = target_oid.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Unborn reference has no target"))?;
+        let mut line = format!("{} {}", target_oid.to_hex(), ref_name.to_str_lossy());
         
-        if let Some(peeled) = reference.peeled_oid() {
-            line.push_str(&format!(" peeled:{}", peeled.to_hex()));
+        if let Some(peeled_oid) = peeled {
+            line.push_str(&format!(" peeled:{}", peeled_oid.to_hex()));
         }
         
         line.push('\n');
@@ -226,19 +254,19 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
     pub fn max_packet_size(&self) -> usize {
         match self.side_band_mode {
             SideBandMode::None => 65520, // Standard Git packet line limit
-            SideBandMode::Basic => 999,   // 1000 - 1 for side-band channel
-            SideBandMode::SideBand64k => 65519, // 65520 - 1 for side-band channel
+            SideBandMode::Basic => 999,   // 1000 - 1 byte for channel
+            SideBandMode::SideBand64k => 65519, // 65520 - 1 byte for channel
         }
     }
     
     /// Check if progress messages are supported
     pub fn supports_progress(&self) -> bool {
-        self.side_band_mode != SideBandMode::None
+        self.side_band_mode.supports_channel(SideBandChannel::Progress)
     }
     
     /// Check if error messages are supported
     pub fn supports_errors(&self) -> bool {
-        self.side_band_mode != SideBandMode::None
+        self.side_band_mode.supports_channel(SideBandChannel::Error)
     }
 }
 
