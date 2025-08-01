@@ -20,7 +20,7 @@ use std::{
 /// Negotiation engine for want/have protocol
 pub struct NegotiationEngine<'a> {
     repository: &'a Repository,
-    options: &'a ServerOptions,
+    // options: &'a ServerOptions,
 }
 
 /// Negotiation state during the protocol exchange
@@ -79,7 +79,7 @@ pub struct NegotiationStats {
 impl<'a> NegotiationEngine<'a> {
     /// Create a new negotiation engine
     pub fn new(repository: &'a Repository, options: &'a ServerOptions) -> Self {
-        Self { repository, options }
+        Self { repository }
     }
     
     /// Perform complete negotiation for protocol v1
@@ -156,71 +156,71 @@ impl<'a> NegotiationEngine<'a> {
         Ok(())
     }
     
-    /// Parse want line and add to state
-    fn parse_want_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
-        let line_str = std::str::from_utf8(line.trim_ascii())
-            .map_err(|_| Error::custom("Invalid UTF-8 in want line"))?;
+    // /// Parse want line and add to state
+    // fn parse_want_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
+    //     let line_str = std::str::from_utf8(line.trim_ascii())
+    //         .map_err(|_| Error::custom("Invalid UTF-8 in want line"))?;
         
-        // Parse just the OID (capabilities are only on first want in v1)
-        let oid_str = line_str.split_whitespace().next()
-            .ok_or_else(|| Error::custom("Empty want line"))?;
+    //     // Parse just the OID (capabilities are only on first want in v1)
+    //     let oid_str = line_str.split_whitespace().next()
+    //         .ok_or_else(|| Error::custom("Empty want line"))?;
         
-        let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
-            .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
+    //     let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
+    //         .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
         
-        state.wants.insert(oid);
-        Ok(())
-    }
+    //     state.wants.insert(oid);
+    //     Ok(())
+    // }
     
-    /// Parse shallow line
-    fn parse_shallow_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
-        let oid_str = std::str::from_utf8(line.trim_ascii())
-            .map_err(|_| Error::custom("Invalid UTF-8 in shallow line"))?;
+    // /// Parse shallow line
+    // fn parse_shallow_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
+    //     let oid_str = std::str::from_utf8(line.trim_ascii())
+    //         .map_err(|_| Error::custom("Invalid UTF-8 in shallow line"))?;
         
-        let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
-            .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
+    //     let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
+    //         .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
             
-        state.shallow.insert(oid);
-        Ok(())
-    }
+    //     state.shallow.insert(oid);
+    //     Ok(())
+    // }
     
-    /// Parse deepen line
-    fn parse_deepen_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
-        let depth_str = std::str::from_utf8(line.trim_ascii())
-            .map_err(|_| Error::custom("Invalid UTF-8 in deepen line"))?;
+    // /// Parse deepen line
+    // fn parse_deepen_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
+    //     let depth_str = std::str::from_utf8(line.trim_ascii())
+    //         .map_err(|_| Error::custom("Invalid UTF-8 in deepen line"))?;
             
-        let depth: u32 = depth_str.parse()
-            .map_err(|_| Error::custom("Invalid depth value"))?;
+    //     let depth: u32 = depth_str.parse()
+    //         .map_err(|_| Error::custom("Invalid depth value"))?;
             
-        state.deepen = Some(DeepenSpec::Depth(depth));
-        Ok(())
-    }
+    //     state.deepen = Some(DeepenSpec::Depth(depth));
+    //     Ok(())
+    // }
     
-    /// Parse deepen-since line
-    fn parse_deepen_since_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
-        let timestamp_str = std::str::from_utf8(line.trim_ascii())
-            .map_err(|_| Error::custom("Invalid UTF-8 in deepen-since line"))?;
+    // /// Parse deepen-since line
+    // fn parse_deepen_since_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
+    //     let timestamp_str = std::str::from_utf8(line.trim_ascii())
+    //         .map_err(|_| Error::custom("Invalid UTF-8 in deepen-since line"))?;
             
-        let timestamp: i64 = timestamp_str.parse()
-            .map_err(|_| Error::custom("Invalid timestamp value"))?;
+    //     let timestamp: i64 = timestamp_str.parse()
+    //         .map_err(|_| Error::custom("Invalid timestamp value"))?;
             
-        let time = gix_date::Time::new(timestamp, 0);
-        state.deepen = Some(DeepenSpec::Since(time));
-        Ok(())
-    }
+    //     let time = gix_date::Time::new(timestamp, 0);
+    //     state.deepen = Some(DeepenSpec::Since(time));
+    //     Ok(())
+    // }
     
-    /// Parse deepen-not line
-    fn parse_deepen_not_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
-        let ref_str = std::str::from_utf8(line.trim_ascii())
-            .map_err(|_| Error::custom("Invalid UTF-8 in deepen-not line"))?;
+    // /// Parse deepen-not line
+    // fn parse_deepen_not_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
+    //     let ref_str = std::str::from_utf8(line.trim_ascii())
+    //         .map_err(|_| Error::custom("Invalid UTF-8 in deepen-not line"))?;
             
-        if let Some(DeepenSpec::Not(ref mut refs)) = state.deepen {
-            refs.push(ref_str.into());
-        } else {
-            state.deepen = Some(DeepenSpec::Not(vec![ref_str.into()]));
-        }
-        Ok(())
-    }
+    //     if let Some(DeepenSpec::Not(ref mut refs)) = state.deepen {
+    //         refs.push(ref_str.into());
+    //     } else {
+    //         state.deepen = Some(DeepenSpec::Not(vec![ref_str.into()]));
+    //     }
+    //     Ok(())
+    // }
     
     /// Validate wanted objects
     fn validate_wants(&self, state: &NegotiationState, capabilities: &ClientCapabilities) -> Result<()> {

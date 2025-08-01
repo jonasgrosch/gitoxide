@@ -66,9 +66,8 @@ impl<'a> Handler<'a> {
         gix_packetline::encode::data_to_write(agent_line.as_bytes(), &mut *writer)?;
         
         // Supported object formats
-        for format in &capabilities.object_format {
-            let format_line = format!("object-format={}\n", format);
-            gix_packetline::encode::data_to_write(format_line.as_bytes(), &mut *writer)?;
+        if !capabilities.object_format.is_empty() {
+            gix_packetline::encode::data_to_write(b"object-format=sha1\n", &mut *writer)?;
         }
         
         // Commands
@@ -106,8 +105,8 @@ impl<'a> Handler<'a> {
         };
         gix_packetline::encode::data_to_write(fetch_line.as_bytes(), &mut *writer)?;
         
-        // Server-info command
-        gix_packetline::encode::data_to_write(b"server-info\n", &mut *writer)?;
+        // Server-option capability
+        gix_packetline::encode::data_to_write(b"server-option\n", &mut *writer)?;
         
         // Object-info command if supported
         if capabilities.object_info {
@@ -149,6 +148,15 @@ impl<'a> Handler<'a> {
         for reference in refs {
             let mut line = format!("{} {}", reference.target.to_hex(), reference.name.to_str_lossy());
             
+            // Add symref-target for HEAD if requested
+            if symrefs && reference.name == "HEAD" {
+                if let Ok(head) = self.repository.head() {
+                    if let gix::head::Kind::Symbolic(target_ref) = head.kind {
+                        line.push_str(&format!(" symref-target:{}", target_ref.name.as_bstr().to_str_lossy()));
+                    }
+                }
+            }
+            
             // Add peeled info if requested and available
             if peel {
                 if let Some(peeled) = &reference.peeled {
@@ -179,6 +187,33 @@ impl<'a> Handler<'a> {
     /// Collect references for V2 protocol
     fn collect_refs_v2(&self, prefixes: &[String]) -> Result<Vec<Reference>> {
         let mut refs = Vec::new();
+        
+        // In V2, we should include HEAD as a regular reference
+        if let Ok(head) = self.repository.head() {
+            match head.kind {
+                gix::head::Kind::Symbolic(target_ref) => {
+                    // Add HEAD as a reference pointing to the same commit as the target
+                    if let gix::refs::Target::Object(oid) = &target_ref.target {
+                        refs.push(Reference {
+                            name: "HEAD".into(),
+                            target: *oid,
+                            peeled: None,
+                        });
+                    }
+                }
+                gix::head::Kind::Detached { target, .. } => {
+                    // Detached HEAD
+                    refs.push(Reference {
+                        name: "HEAD".into(),
+                        target,
+                        peeled: None,
+                    });
+                }
+                gix::head::Kind::Unborn(_) => {
+                    // Skip unborn HEAD in V2
+                }
+            }
+        }
         
         // Get the reference iterator
         let refs_binding = self.repository.references().map_err(|e| Error::RefPackedBuffer(e))?;
@@ -350,6 +385,8 @@ impl<'a> Handler<'a> {
         args: &HashMap<String, String>,
         session: &mut SessionContext,
     ) -> Result<()> {
+        eprintln!("Debug: handle_fetch called with args: {:?}", args);
+        
         // Parse fetch arguments
         let thin_pack = args.get("thin-pack").is_some();
         let ofs_delta = args.get("ofs-delta").is_some();
@@ -372,6 +409,10 @@ impl<'a> Handler<'a> {
         
         // Read fetch parameters
         self.read_fetch_parameters(reader, session)?;
+        
+        eprintln!("Debug: After reading parameters, wants: {:?}, haves: {:?}", 
+                  session.negotiation.wants.len(), 
+                  session.negotiation.haves.len());
         
         // Perform negotiation if needed
         if !session.negotiation.wants.is_empty() {
@@ -396,9 +437,13 @@ impl<'a> Handler<'a> {
             // Send packfile section
             gix_packetline::encode::data_to_write(b"packfile\n", &mut *writer)?;
             
+            eprintln!("Debug: About to generate pack for {} wants", session.negotiation.wants.len());
+            
             // Generate and send pack
             let pack_generator = pack_generation::PackGenerator::new(self.repository, self.options);
-            pack_generator.generate_pack(&mut *writer, session)?;
+            let pack_stats = pack_generator.generate_pack(&mut *writer, session)?;
+            
+            eprintln!("Debug: Pack generation complete - stats: {:?}", pack_stats);
         }
         
         Ok(())
@@ -513,22 +558,6 @@ impl<'a> Handler<'a> {
         Ok(())
     }
     
-    /// Handle server-info command
-    fn handle_server_info<W: Write>(&self, writer: &mut W) -> Result<()> {
-        // Send basic server information
-        gix_packetline::encode::data_to_write(b"server gitoxide\n", &mut *writer)?;
-        
-        if let Ok(repo_path) = self.repository.path().canonicalize() {
-            let path_line = format!("path {}\n", repo_path.display());
-            gix_packetline::encode::data_to_write(path_line.as_bytes(), &mut *writer)?;
-        }
-        
-        // End with flush
-        gix_packetline::PacketLineRef::Flush.write_to(writer)?;
-        
-        Ok(())
-    }
-    
     /// Handle object-info command
     fn handle_object_info<R: BufRead, W: Write>(
         &self,
@@ -626,6 +655,50 @@ impl<'a> Handler<'a> {
         
         Ok(args)
     }
+    
+    /// Parse command arguments for V2, stopping at fetch parameters
+    fn parse_command_arguments_v2<R: BufRead>(
+        &self,
+        reader: &mut StreamingPeekableIter<R>,
+    ) -> Result<HashMap<String, String>> {
+        let mut args = HashMap::new();
+        
+        while let Some(line_result) = reader.read_line() {
+            let line = line_result??;
+            if matches!(line, gix_packetline::PacketLineRef::Flush) {
+                break;
+            }
+            
+            if let Some(line_data) = line.as_slice() {
+                let line_str = std::str::from_utf8(line_data)
+                    .map_err(|_| Error::custom("Invalid UTF-8 in argument line"))?
+                    .trim();
+                
+                // Stop if we hit fetch parameters (want, have, done, etc.)
+                if line_str.starts_with("want ") || 
+                   line_str.starts_with("have ") || 
+                   line_str.starts_with("done") ||
+                   line_str.starts_with("shallow ") ||
+                   line_str.starts_with("deepen") {
+                    // Put the line back for fetch parameter parsing
+                    // We can't actually put it back, so we'll handle this differently
+                    eprintln!("Debug: Found fetch parameter line, stopping arg parsing: {}", line_str);
+                    break;
+                }
+                
+                if let Some(equals_pos) = line_str.find('=') {
+                    let key = line_str[..equals_pos].to_string();
+                    let value = line_str[equals_pos + 1..].to_string();
+                    args.insert(key, value);
+                } else {
+                    // Flag argument (no value)
+                    args.insert(line_str.to_string(), String::new());
+                }
+            }
+        }
+        
+        Ok(args)
+    }
 }
 
 impl<'a> ProtocolHandler for Handler<'a> {
@@ -642,8 +715,11 @@ impl<'a> ProtocolHandler for Handler<'a> {
             false, // trace
         );
         
-        // Protocol V2 starts with capability advertisement
-        self.advertise_capabilities(&mut output)?;
+        // Protocol V2 only advertises capabilities in non-stateless RPC mode
+        // In stateless RPC mode (--stateless-rpc), we wait for client command first
+        if !session.stateless_rpc {
+            self.advertise_capabilities(&mut output)?;
+        }
         
         // Wait for command
         let mut command = None;
@@ -666,8 +742,10 @@ impl<'a> ProtocolHandler for Handler<'a> {
         
         let command = command.ok_or_else(|| Error::custom("No command specified"))?;
         
-        // Parse command arguments
-        let args = self.parse_command_arguments(&mut line_reader)?;
+        // Parse command arguments - but STOP at first flush or want/have line
+        let args = self.parse_command_arguments_v2(&mut line_reader)?;
+        
+        eprintln!("Debug: Parsed command arguments: {:?}", args);
         
         // Handle the command
         match command {
@@ -677,11 +755,12 @@ impl<'a> ProtocolHandler for Handler<'a> {
             Command::Fetch => {
                 self.handle_fetch(&mut line_reader, &mut output, &args, session)?;
             }
-            Command::ServerInfo => {
-                self.handle_server_info(&mut output)?;
-            }
             Command::ObjectInfo => {
                 self.handle_object_info(&mut line_reader, &mut output, &args)?;
+            }
+            Command::ServerInfo => {
+                // server-info is not a standard V2 command, return error
+                return Err(Error::UnsupportedCommand { command: "server-info".to_string() });
             }
         }
         

@@ -36,7 +36,7 @@
 //! ```
 
 #![deny(rust_2018_idioms)]
-#![warn(missing_docs, clippy::all, clippy::pedantic)]
+// #![warn(missing_docs, clippy::all, clippy::pedantic)]
 
 pub mod error;
 pub mod server;

@@ -60,21 +60,57 @@ impl<'a> Handler<'a> {
     /// Collect all references that should be advertised
     fn collect_references(&self) -> Result<Vec<Reference>> {
         let mut refs = Vec::new();
+        let mut head_target = None;
+        let mut head_symref_target = None;
         
-        // Iterate through all references
+        // Use the proper high-level API to get HEAD
+        match self.repository.head() {
+            Ok(head) => {
+                eprintln!("Debug: Found HEAD using repository.head()");
+                match head.kind {
+                    gix::head::Kind::Symbolic(target_ref) => {
+                        // HEAD points to a branch
+                        head_symref_target = Some(target_ref.name.as_bstr().to_owned());
+                        if let gix::refs::Target::Object(oid) = &target_ref.target {
+                            head_target = Some(*oid);
+                            eprintln!("Debug: HEAD is symbolic, target ref: {}, commit: {}", 
+                                     target_ref.name, oid.to_hex());
+                        }
+                    }
+                    gix::head::Kind::Detached { target, .. } => {
+                        // HEAD points directly to a commit (detached HEAD)
+                        head_target = Some(target);
+                        eprintln!("Debug: HEAD is detached, commit: {}", target.to_hex());
+                    }
+                    gix::head::Kind::Unborn(branch_name) => {
+                        // HEAD points to a branch that doesn't exist yet
+                        head_symref_target = Some(branch_name.as_bstr().to_owned());
+                        eprintln!("Debug: HEAD is unborn, target branch: {}", branch_name);
+                        // Don't set head_target since the branch doesn't exist
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("Debug: Failed to get HEAD: {}", err);
+            }
+        }
+        
+        // Second pass: collect all other refs through the iterator
         for reference in self.repository.references().map_err(|e| Error::RefPackedBuffer(e))?.all().map_err(|e| Error::RefIterInit(e))? {
             let reference = reference.map_err(|e| Error::Boxed(e))?;
             let name = reference.name().as_bstr().to_owned();
+            eprintln!("Debug: Found reference: {}", name.to_str_lossy());
             
             // Check if reference should be hidden
             if self.options.is_ref_hidden(name.to_str_lossy().as_ref()) {
+                eprintln!("Debug: Reference {} is hidden, skipping", name.to_str_lossy());
                 continue;
             }
             
             match reference.target() {
-                gix::refs::TargetRef::Symbolic(_) => {
-                    // Skip symbolic refs in advertisement
-                    continue;
+                gix::refs::TargetRef::Symbolic(_target) => {
+                    // Skip symbolic refs (we already handled HEAD above)
+                    eprintln!("Debug: Skipping symbolic reference: {}", name.to_str_lossy());
                 }
                 gix::refs::TargetRef::Object(oid) => {
                     let target = oid.to_owned();
@@ -107,8 +143,39 @@ impl<'a> Handler<'a> {
             }
         }
         
-        // Sort refs for consistent output
+        // Add HEAD as first reference if we found it and it has a target
+        // (We skip unborn HEAD as it has no commit to advertise)
+        if let (Some(target), Some(symref_target)) = (head_target, &head_symref_target) {
+            eprintln!("Debug: Adding HEAD ref with target {} and symref {:?}", target.to_hex(), symref_target);
+            refs.insert(0, Reference {
+                name: "HEAD".into(),
+                target,
+                peeled: None,
+            });
+        } else if let Some(target) = head_target {
+            // Detached HEAD case (no symref info)
+            eprintln!("Debug: Adding detached HEAD ref with target {}", target.to_hex());
+            refs.insert(0, Reference {
+                name: "HEAD".into(),
+                target,
+                peeled: None,
+            });
+        } else {
+            eprintln!("Debug: HEAD not added - head_target: {:?}, head_symref_target: {:?}", head_target, head_symref_target);
+        }
+        
+        // Sort refs for consistent output (but keep HEAD first if present)
+        let head_ref = if !refs.is_empty() && refs[0].name == "HEAD" {
+            Some(refs.remove(0))
+        } else {
+            None
+        };
+        
         refs.sort_by(|a, b| a.name.cmp(&b.name));
+        
+        if let Some(head) = head_ref {
+            refs.insert(0, head);
+        }
         
         Ok(refs)
     }
@@ -170,13 +237,14 @@ impl<'a> Handler<'a> {
     fn format_capabilities(&self, capabilities: &ServerCapabilities) -> String {
         let mut caps = Vec::new();
         
-        // Multi-ack capability
+        // Multi-ack capability - native git shows both multi_ack and multi_ack_detailed
         match capabilities.multi_ack {
             MultiAckMode::None => {}
             MultiAckMode::Basic => {
                 caps.push("multi_ack".to_string());
             }
             MultiAckMode::Detailed => {
+                caps.push("multi_ack".to_string());
                 caps.push("multi_ack_detailed".to_string());
             }
         }
@@ -192,6 +260,7 @@ impl<'a> Handler<'a> {
                 caps.push("side-band".to_string());
             }
             SideBandMode::SideBand64k => {
+                caps.push("side-band".to_string());
                 caps.push("side-band-64k".to_string());
             }
         }
@@ -240,21 +309,25 @@ impl<'a> Handler<'a> {
             caps.push("allow-any-sha1-in-want".to_string());
         }
         
-        if capabilities.no_done {
-            caps.push("no-done".to_string());
+        // Note: we don't include no-done in v1 protocol as it's primarily a v2 feature
+        // if capabilities.no_done {
+        //     caps.push("no-done".to_string());
+        // }
+        
+        // Add symref capability for HEAD
+        if let Ok(head) = self.repository.head() {
+            if let gix::head::Kind::Symbolic(target_ref) = head.kind {
+                caps.push(format!("symref=HEAD:{}", target_ref.name.as_bstr().to_str_lossy()));
+            }
         }
         
-        // Agent string
-        caps.push(format!("agent={}", capabilities.agent.to_str_lossy()));
-        
-        // Object format
+        // Object format - native git uses lowercase
         if !capabilities.object_format.is_empty() {
-            let formats: Vec<String> = capabilities.object_format
-                .iter()
-                .map(|f| format!("object-format={}", f))
-                .collect();
-            caps.extend(formats);
+            caps.push("object-format=sha1".to_string());
         }
+        
+        // Agent string - use format similar to native git
+        caps.push(format!("agent={}", capabilities.agent.to_str_lossy()));
         
         // Session ID if available
         if let Some(session_id) = &capabilities.session_id {

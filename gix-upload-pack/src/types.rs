@@ -183,7 +183,7 @@ impl Default for ServerCapabilities {
             deepen_not: true,
             deepen_relative: true,
             no_progress: true,
-            filter: true,
+            filter: false,
             allow_tip_sha1_in_want: false,
             allow_reachable_sha1_in_want: false,
             allow_any_sha1_in_want: false,
