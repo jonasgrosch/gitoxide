@@ -30,6 +30,8 @@ pub enum Command {
     LsRefs,
     /// Fetch a pack.
     Fetch,
+    /// Object info
+    ObjectInfo,
 }
 pub mod command;
 
