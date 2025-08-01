@@ -19,8 +19,6 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-#[cfg(feature = "async")]
-use futures_lite::io::{AsyncWrite, AsyncWriteExt};
 
 /// Adapter to make Repository objects compatible with gix_pack::Find trait
 #[derive(Clone)]
@@ -99,46 +97,6 @@ impl<'a> PackGenerator<'a> {
     }
     
     /// Generate a pack file using gix-pack infrastructure
-    #[cfg(feature = "async")]
-    pub async fn generate_pack<W: AsyncWrite + Unpin>(
-        &self,
-        writer: W,
-        session: &SessionContext,
-    ) -> Result<PackStats> {
-        let start_time = std::time::Instant::now();
-        
-        // Step 1: Collect object IDs that need to be packed
-        let object_ids = self.collect_object_ids(session)?;
-        eprintln!("Debug: Collected {} objects for advanced packing", object_ids.len());
-        
-        if object_ids.is_empty() {
-            // Return empty pack
-            return self.write_empty_pack(writer).await;
-        }
-        
-        // Step 2: Use gix-pack's count::objects to analyze the objects
-        let (counts, count_stats) = self.count_objects(object_ids)?;
-        eprintln!("Debug: Object counting complete - {} total objects", count_stats.total_objects);
-        
-        // Step 3: Convert counts to pack entries using gix-pack
-        let entries_iter = self.create_entries_iterator(counts, session)?;
-
-        // Step 4: Stream pack data using gix-pack's FromEntriesIter (async version)
-        let pack_stats = self.stream_pack_data_async(writer, entries_iter, count_stats.total_objects).await?;
-        
-        let generation_time = start_time.elapsed();
-        
-        Ok(PackStats {
-            object_count: pack_stats.object_count,
-            pack_size: pack_stats.pack_size,
-            delta_objects: pack_stats.delta_objects,
-            compression_ratio: pack_stats.compression_ratio,
-            generation_time_ms: generation_time.as_millis() as u64,
-        })
-    }
-
-    /// Generate a pack file using gix-pack infrastructure (sync version)
-    #[cfg(not(feature = "async"))]
     pub fn generate_pack<W: Write>(
         &self,
         writer: W,
@@ -339,71 +297,9 @@ impl<'a> PackGenerator<'a> {
         })
     }
 
-    /// Stream pack data using gix-pack's FromEntriesIter (async version)
-    #[cfg(feature = "async")]
-    async fn stream_pack_data_async<W: AsyncWrite + Unpin, I, E>(
-        &self,
-        mut writer: W,
-        entries_iter: I,
-        total_objects: usize,
-    ) -> Result<PackGenerationStats>
-    where
-        I: Iterator<Item = std::result::Result<(usize, Vec<output::Entry>), E>>,
-        E: std::error::Error + 'static,
-    {
-        // For now, we'll use a buffer approach since gix-pack doesn't support async yet
-        let mut buffer = Vec::new();
-        
-        // Use the sync stream_pack_data to write to buffer
-        let pack_stats = self.stream_pack_data(&mut buffer, entries_iter, total_objects)?;
-        
-        // Now write the buffer async
-        use futures_lite::AsyncWriteExt;
-        writer.write_all(&buffer).await
-            .map_err(|e| Error::Pack(format!("Failed to write pack data: {}", e)))?;
-        
-        Ok(pack_stats)
-    }
+    // Async support removed - stream_pack_data is now the only implementation
     
     /// Write an empty pack when no objects need to be sent
-    #[cfg(feature = "async")]
-    async fn write_empty_pack<W: AsyncWrite + Unpin>(&self, mut writer: W) -> Result<PackStats> {
-        // Use buffer approach for empty pack as well
-        let mut buffer = Vec::new();
-        
-        // Write empty pack: header + no entries + checksum
-        let empty_entries: Vec<output::Entry> = Vec::new();
-        let entries_iter = std::iter::once(Ok(empty_entries));
-        
-        let mut pack_writer = output::bytes::FromEntriesIter::new(
-            entries_iter,
-            &mut buffer,
-            0,
-            gix_pack::data::Version::V2,
-            self.repository.object_hash(),
-        );
-        
-        // Write the empty pack to buffer
-        for result in &mut pack_writer {
-            result.map_err(|e: gix_pack::data::output::bytes::Error<std::convert::Infallible>| Error::Pack(format!("Empty pack generation failed: {}", e)))?;
-        }
-        
-        // Write buffer async
-        use futures_lite::AsyncWriteExt;
-        writer.write_all(&buffer).await
-            .map_err(|e| Error::Pack(format!("Failed to write empty pack: {}", e)))?;
-        
-        Ok(PackStats {
-            object_count: 0,
-            pack_size: buffer.len() as u64,
-            delta_objects: 0,
-            compression_ratio: 1.0,
-            generation_time_ms: 0,
-        })
-    }
-
-    /// Write an empty pack when no objects need to be sent (sync version)
-    #[cfg(not(feature = "async"))]
     fn write_empty_pack<W: Write>(&self, writer: W) -> Result<PackStats> {
         // Write empty pack: header + no entries + checksum
         let empty_entries: Vec<output::Entry> = Vec::new();

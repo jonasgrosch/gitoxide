@@ -19,55 +19,6 @@ pub use gix_shallow::Update as ShallowUpdate;
 // Use ProtocolRef directly as our Reference type
 pub type Reference = ProtocolRef;
 
-/// Helper trait for working with protocol references
-pub trait ProtocolRefExt {
-    /// Get the reference name
-    fn ref_name(&self) -> &BString;
-    /// Get the target object ID
-    fn target_oid(&self) -> ObjectId;
-    /// Get the peeled object ID if this is a peeled ref
-    fn peeled_oid(&self) -> Option<ObjectId>;
-    /// Check if this is a symbolic reference
-    fn is_symbolic_ref(&self) -> bool;
-    /// Check if this is an unborn reference
-    fn is_unborn_ref(&self) -> bool;
-}
-
-impl ProtocolRefExt for ProtocolRef {
-    fn ref_name(&self) -> &BString {
-        match self {
-            ProtocolRef::Peeled { full_ref_name, .. } => full_ref_name,
-            ProtocolRef::Direct { full_ref_name, .. } => full_ref_name,
-            ProtocolRef::Symbolic { full_ref_name, .. } => full_ref_name,
-            ProtocolRef::Unborn { full_ref_name, .. } => full_ref_name,
-        }
-    }
-    
-    fn target_oid(&self) -> ObjectId {
-        match self {
-            ProtocolRef::Peeled { object, .. } => *object,
-            ProtocolRef::Direct { object, .. } => *object,
-            ProtocolRef::Symbolic { object, .. } => *object,
-            ProtocolRef::Unborn { .. } => ObjectId::null(gix_hash::Kind::Sha1),
-        }
-    }
-    
-    fn peeled_oid(&self) -> Option<ObjectId> {
-        match self {
-            ProtocolRef::Peeled { object, .. } => Some(*object),
-            _ => None,
-        }
-    }
-    
-    fn is_symbolic_ref(&self) -> bool {
-        matches!(self, ProtocolRef::Symbolic { .. })
-    }
-    
-    fn is_unborn_ref(&self) -> bool {
-        matches!(self, ProtocolRef::Unborn { .. })
-    }
-}
-
 /// Multi-ack modes for negotiation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultiAckMode {
@@ -85,7 +36,9 @@ impl Default for MultiAckMode {
     }
 }
 
-/// Side-band modes for multiplexed communication
+/// Side-band capability levels for protocol negotiation.
+/// This represents the negotiated side-band capability level, not the actual channel types
+/// (which are represented by `gix_packetline::Channel`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideBandMode {
     /// No side-band support
@@ -99,6 +52,53 @@ pub enum SideBandMode {
 impl Default for SideBandMode {
     fn default() -> Self {
         Self::None
+    }
+}
+
+impl SideBandMode {
+    /// Returns the maximum data size per packet for this side-band mode
+    pub fn max_data_size(self) -> Option<usize> {
+        match self {
+            SideBandMode::None => None,
+            SideBandMode::Basic => Some(999),      // 1000 - 1 byte for channel
+            SideBandMode::SideBand64k => Some(65519), // 65520 - 1 byte for channel
+        }
+    }
+
+    /// Returns true if this mode supports the given channel type
+    pub fn supports_channel(self, channel: SideBandChannel) -> bool {
+        match self {
+            SideBandMode::None => false,
+            SideBandMode::Basic => matches!(channel, SideBandChannel::Progress),
+            SideBandMode::SideBand64k => true, // Supports all channels
+        }
+    }
+
+    /// Convert from capability strings as they appear in the protocol
+    pub fn from_capability_string(capability: &str) -> Option<Self> {
+        match capability {
+            "side-band" => Some(SideBandMode::Basic),
+            "side-band-64k" => Some(SideBandMode::SideBand64k),
+            _ => None,
+        }
+    }
+
+    /// Convert to protocol v1 capability strings
+    pub fn to_capability_strings(&self) -> Vec<&'static str> {
+        match self {
+            SideBandMode::None => vec![],
+            SideBandMode::Basic => vec!["side-band"],
+            SideBandMode::SideBand64k => vec!["side-band", "side-band-64k"],
+        }
+    }
+    
+    /// Convert to protocol v2 capability strings
+    pub fn to_v2_capability_strings(&self) -> Vec<&'static str> {
+        match self {
+            SideBandMode::None => vec![],
+            SideBandMode::Basic => vec!["sideband"],
+            SideBandMode::SideBand64k => vec!["sideband-all"],
+        }
     }
 }
 
@@ -161,7 +161,7 @@ impl Default for ServerCapabilities {
             deepen_since: true,
             deepen_not: true,
             deepen_relative: true,
-            no_progress: true,
+            no_progress: false,
             filter: false,
             allow_tip_sha1_in_want: false,
             allow_reachable_sha1_in_want: false,
@@ -380,5 +380,72 @@ impl SessionContext {
     /// Get session duration
     pub fn duration(&self) -> std::time::Duration {
         self.start_time.elapsed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gix_packetline::Channel as SideBandChannel;
+
+    #[test]
+    fn test_sideband_mode_max_data_size() {
+        assert_eq!(SideBandMode::None.max_data_size(), None);
+        assert_eq!(SideBandMode::Basic.max_data_size(), Some(999));
+        assert_eq!(SideBandMode::SideBand64k.max_data_size(), Some(65519));
+    }
+
+    #[test]
+    fn test_sideband_mode_supports_channel() {
+        // None supports no channels
+        assert!(!SideBandMode::None.supports_channel(SideBandChannel::Data));
+        assert!(!SideBandMode::None.supports_channel(SideBandChannel::Progress));
+        assert!(!SideBandMode::None.supports_channel(SideBandChannel::Error));
+        
+        // Basic only supports Progress
+        assert!(!SideBandMode::Basic.supports_channel(SideBandChannel::Data));
+        assert!(SideBandMode::Basic.supports_channel(SideBandChannel::Progress));
+        assert!(!SideBandMode::Basic.supports_channel(SideBandChannel::Error));
+        
+        // SideBand64k supports all channels
+        assert!(SideBandMode::SideBand64k.supports_channel(SideBandChannel::Data));
+        assert!(SideBandMode::SideBand64k.supports_channel(SideBandChannel::Progress));
+        assert!(SideBandMode::SideBand64k.supports_channel(SideBandChannel::Error));
+    }
+
+    #[test]
+    fn test_sideband_mode_from_capability_string() {
+        assert_eq!(SideBandMode::from_capability_string("side-band"), Some(SideBandMode::Basic));
+        assert_eq!(SideBandMode::from_capability_string("side-band-64k"), Some(SideBandMode::SideBand64k));
+        assert_eq!(SideBandMode::from_capability_string("unknown"), None);
+        assert_eq!(SideBandMode::from_capability_string(""), None);
+    }
+
+    #[test]
+    fn test_sideband_mode_to_capability_strings() {
+        assert_eq!(SideBandMode::None.to_capability_strings(), Vec::<&str>::new());
+        assert_eq!(SideBandMode::Basic.to_capability_strings(), vec!["side-band"]);
+        assert_eq!(SideBandMode::SideBand64k.to_capability_strings(), vec!["side-band", "side-band-64k"]);
+    }
+
+    #[test]
+    fn test_sideband_mode_to_v2_capability_strings() {
+        assert_eq!(SideBandMode::None.to_v2_capability_strings(), Vec::<&str>::new());
+        assert_eq!(SideBandMode::Basic.to_v2_capability_strings(), vec!["sideband"]);
+        assert_eq!(SideBandMode::SideBand64k.to_v2_capability_strings(), vec!["sideband-all"]);
+    }
+
+    #[test]
+    fn test_capability_roundtrip() {
+        // Test v1 capabilities
+        assert_eq!(SideBandMode::from_capability_string("side-band"), Some(SideBandMode::Basic));
+        assert_eq!(SideBandMode::from_capability_string("side-band-64k"), Some(SideBandMode::SideBand64k));
+        
+        // Test that the first capability from SideBand64k mode can roundtrip to Basic
+        // (This is expected behavior since "side-band" appears first)
+        let sideband64k_caps = SideBandMode::SideBand64k.to_capability_strings();
+        assert_eq!(sideband64k_caps, vec!["side-band", "side-band-64k"]);
+        assert_eq!(SideBandMode::from_capability_string(sideband64k_caps[0]), Some(SideBandMode::Basic));
+        assert_eq!(SideBandMode::from_capability_string(sideband64k_caps[1]), Some(SideBandMode::SideBand64k));
     }
 }

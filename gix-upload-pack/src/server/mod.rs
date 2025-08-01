@@ -8,16 +8,12 @@ use crate::{
 };
 use gix::Repository;
 use std::io::{Read, Write};
-
-#[cfg(feature = "async")]
-use futures_lite::io::{AsyncRead, AsyncWrite};
 use std::path::{Path, PathBuf};
 
 pub mod capabilities;
 pub mod handshake;
 pub mod negotiation;
 pub mod pack_generation;
-pub mod response;
 
 /// The main upload-pack server implementation
 #[derive(Debug)]
@@ -65,51 +61,6 @@ impl Server {
     }
     
     /// Serve upload-pack protocol over the given input/output streams
-    #[cfg(feature = "async")]
-    pub async fn serve<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(&mut self, input: R, output: W) -> Result<()> {
-        let mut session = SessionContext::new(&self.repository_path);
-        session.stateless_rpc = self.options.stateless_rpc;
-        
-        // Determine protocol version using environment variable or default for now
-        session.protocol_version = self.detect_protocol_version()?;
-        eprintln!("Debug: Using protocol version: {:?}", session.protocol_version);
-        
-        match session.protocol_version {
-            ProtocolVersion::V0 | ProtocolVersion::V1 => {
-                self.serve_v1(input, output, session).await
-            }
-            ProtocolVersion::V2 => {
-                self.serve_v2(input, output, session).await
-            }
-        }
-    }
-    
-    /// Serve using protocol version 1
-    #[cfg(feature = "async")]
-    async fn serve_v1<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-        &mut self,
-        input: R,
-        output: W,
-        mut session: SessionContext,
-    ) -> Result<()> {
-        let mut handler = v1::Handler::new(&self.repository, &self.options);
-        handler.handle_session(input, output, &mut session).await
-    }
-    
-    /// Serve using protocol version 2
-    #[cfg(feature = "async")]
-    async fn serve_v2<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-        &mut self,
-        input: R,
-        output: W,
-        mut session: SessionContext,
-    ) -> Result<()> {
-        let mut handler = v2::Handler::new(&self.repository, &self.options);
-        handler.handle_session(input, output, &mut session).await
-    }
-
-    /// Serve upload-pack protocol over the given input/output streams (sync version)
-    #[cfg(not(feature = "async"))]
     pub fn serve<R: Read, W: Write>(&mut self, input: R, output: W) -> Result<()> {
         let mut session = SessionContext::new(&self.repository_path);
         session.stateless_rpc = self.options.stateless_rpc;
@@ -128,8 +79,7 @@ impl Server {
         }
     }
 
-    /// Serve using protocol version 1 (sync version)
-    #[cfg(not(feature = "async"))]
+    /// Serve using protocol version 1
     fn serve_v1<R: Read, W: Write>(
         &mut self,
         input: R,
@@ -140,8 +90,7 @@ impl Server {
         handler.handle_session(input, output, &mut session)
     }
     
-    /// Serve using protocol version 2 (sync version)
-    #[cfg(not(feature = "async"))]
+    /// Serve using protocol version 2
     fn serve_v2<R: Read, W: Write>(
         &mut self,
         input: R,

@@ -11,14 +11,14 @@ use crate::{
 };
 use bstr::{BString, ByteSlice};
 use gix::Repository;
+use gix_pack::Find;
 use gix_packetline::{PacketLineRef, StreamingPeekableIter};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, Write},
 };
 
-#[cfg(feature = "async")]
-use futures_lite::io::{AsyncRead, AsyncWrite};
+// Async support removed - now fully synchronous
 
 /// Negotiation engine for want/have protocol
 pub struct NegotiationEngine<'a> {
@@ -86,42 +86,6 @@ impl<'a> NegotiationEngine<'a> {
     }
     
     /// Perform complete negotiation for protocol v1
-    #[cfg(feature = "async")]
-    pub async fn negotiate_v1<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-        &mut self,
-        reader: &mut StreamingPeekableIter<R>,
-        writer: &mut W,
-        capabilities: &ClientCapabilities,
-    ) -> Result<NegotiationResult> {
-        let start_time = std::time::Instant::now();
-        let mut state = NegotiationState::default();
-        
-        // Phase 1: Collect wants and setup
-        self.collect_wants_v1(reader, &mut state, capabilities).await?;
-        
-        // Phase 2: Process haves and send ACKs
-        self.process_haves_v1(reader, writer, &mut state, capabilities).await?;
-        
-        // Phase 3: Finalize negotiation
-        let result = self.finalize_negotiation(&state)?;
-        
-        let negotiation_time = start_time.elapsed();
-        Ok(NegotiationResult {
-            pack_objects: result.pack_objects,
-            shallow_commits: result.shallow_commits,
-            complete: result.complete,
-            stats: NegotiationStats {
-                rounds: state.round,
-                want_count: state.wants.len() as u32,
-                have_count: state.haves.len() as u32,
-                common_count: state.common.len() as u32,
-                negotiation_time,
-            },
-        })
-    }
-
-    /// Perform complete negotiation for protocol v1 (sync version)
-    #[cfg(not(feature = "async"))]
     pub fn negotiate_v1<R: BufRead, W: Write>(
         &mut self,
         reader: &mut StreamingPeekableIter<R>,
@@ -156,36 +120,31 @@ impl<'a> NegotiationEngine<'a> {
     }
     
     /// Collect want lines and initial parameters
-    #[cfg(feature = "async")]
-    async fn collect_wants_v1<R: AsyncRead + Unpin>(
+    fn collect_wants_v1<R: BufRead>(
         &mut self,
         reader: &mut StreamingPeekableIter<R>,
         state: &mut NegotiationState,
         capabilities: &ClientCapabilities,
     ) -> Result<()> {
-        while let Some(line) = reader.read_line().await {
-            match line? {
-                line => {
-                    match line.map_err(|e| Error::custom(format!("Packetline decode error: {}", e)))? {
-                        PacketLineRef::Flush => {
-                            break;
-                        }
-                        PacketLineRef::Data(data) => {
-                            if data.starts_with(b"want ") {
-                                let rest = &data[5..]; // skip "want "
-                                if let Some(space_pos) = rest.iter().position(|&b| b == b' ') {
-                                    let oid_str = &rest[..space_pos];
-                                    if let Ok(oid) = gix_hash::ObjectId::from_hex(oid_str) {
-                                        state.wants.insert(oid);
-                                    }
-                                }
-                            }
-                            // Parse other commands...
-                        }
-                        _ => {
-                            // Handle other packet line types if needed
-                        }
-                    }
+        while let Some(line) = reader.read_line() {
+            let line = line??;
+            if matches!(line, PacketLineRef::Flush) {
+                break;
+            }
+            
+            if let Some(line_data) = line.as_slice() {
+                if let Some(want_line) = line_data.strip_prefix(b"want ") {
+                    let oid = self.parse_want_line(want_line, state)?;
+                    eprintln!("Debug: Client wants: {}", oid.to_hex());
+                } else if let Some(shallow_line) = line_data.strip_prefix(b"shallow ") {
+                    let oid = self.parse_shallow_line(shallow_line, state)?;
+                    eprintln!("Debug: Client shallow: {}", oid.to_hex());
+                } else if let Some(deepen_line) = line_data.strip_prefix(b"deepen ") {
+                    self.parse_deepen_line(deepen_line, state)?;
+                } else if let Some(deepen_since_line) = line_data.strip_prefix(b"deepen-since ") {
+                    self.parse_deepen_since_line(deepen_since_line, state)?;
+                } else if let Some(deepen_not_line) = line_data.strip_prefix(b"deepen-not ") {
+                    self.parse_deepen_not_line(deepen_not_line, state)?;
                 }
             }
         }
@@ -195,44 +154,70 @@ impl<'a> NegotiationEngine<'a> {
         
         Ok(())
     }
-
-    /// Collect want lines and initial parameters (sync version)
-    #[cfg(not(feature = "async"))]
-    fn collect_wants_v1<R: BufRead>(
-        &mut self,
-        reader: &mut StreamingPeekableIter<R>,
-        state: &mut NegotiationState,
-        capabilities: &ClientCapabilities,
-    ) -> Result<()> {
-        while let Some(line) = reader.read_line() {
-            match line? {
-                line => {
-                    if matches!(line, PacketLineRef::Flush) {
-                        break;
-                    }
-                    
-                    if let Some(line_data) = line.as_slice() {
-                        if let Some(want_line) = line_data.strip_prefix(b"want ") {
-                            let oid = self.parse_want_line(want_line, state)?;
-                            eprintln!("Debug: Client wants: {}", oid.to_hex());
-                        } else if let Some(shallow_line) = line_data.strip_prefix(b"shallow ") {
-                            let oid = self.parse_shallow_line(shallow_line, state)?;
-                            eprintln!("Debug: Client shallow: {}", oid.to_hex());
-                        } else if let Some(deepen_line) = line_data.strip_prefix(b"deepen ") {
-                            self.parse_deepen_line(deepen_line, state)?;
-                        } else if let Some(deepen_since_line) = line_data.strip_prefix(b"deepen-since ") {
-                            self.parse_deepen_since_line(deepen_since_line, state)?;
-                        } else if let Some(deepen_not_line) = line_data.strip_prefix(b"deepen-not ") {
-                            self.parse_deepen_not_line(deepen_not_line, state)?;
-                        }
-                    }
-                }
-            }
+    
+    /// Parse want line and add to state
+    fn parse_want_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<gix_hash::ObjectId> {
+        let line_str = std::str::from_utf8(line.trim_ascii())
+            .map_err(|_| Error::custom("Invalid UTF-8 in want line"))?;
+        
+        // Parse just the OID (capabilities are only on first want in v1)
+        let oid_str = line_str.split_whitespace().next()
+            .ok_or_else(|| Error::custom("Empty want line"))?;
+        
+        let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
+            .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
+        
+        state.wants.insert(oid);
+        Ok(oid)
+    }
+    
+    /// Parse shallow line
+    fn parse_shallow_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<gix_hash::ObjectId> {
+        let oid_str = std::str::from_utf8(line.trim_ascii())
+            .map_err(|_| Error::custom("Invalid UTF-8 in shallow line"))?;
+        
+        let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
+            .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
+            
+        state.shallow.insert(oid);
+        Ok(oid)
+    }
+    
+    /// Parse deepen line
+    fn parse_deepen_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
+        let depth_str = std::str::from_utf8(line.trim_ascii())
+            .map_err(|_| Error::custom("Invalid UTF-8 in deepen line"))?;
+            
+        let depth: u32 = depth_str.parse()
+            .map_err(|_| Error::custom("Invalid depth value"))?;
+            
+        state.deepen = Some(DeepenSpec::Depth(depth));
+        Ok(())
+    }
+    
+    /// Parse deepen-since line
+    fn parse_deepen_since_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
+        let timestamp_str = std::str::from_utf8(line.trim_ascii())
+            .map_err(|_| Error::custom("Invalid UTF-8 in deepen-since line"))?;
+            
+        let timestamp: i64 = timestamp_str.parse()
+            .map_err(|_| Error::custom("Invalid timestamp value"))?;
+            
+        let time = gix_date::Time::new(timestamp, 0);
+        state.deepen = Some(DeepenSpec::Since(time));
+        Ok(())
+    }
+    
+    /// Parse deepen-not line
+    fn parse_deepen_not_line(&self, line: &[u8], state: &mut NegotiationState) -> Result<()> {
+        let ref_str = std::str::from_utf8(line.trim_ascii())
+            .map_err(|_| Error::custom("Invalid UTF-8 in deepen-not line"))?;
+            
+        if let Some(DeepenSpec::Not(ref mut refs)) = state.deepen {
+            refs.push(ref_str.into());
+        } else {
+            state.deepen = Some(DeepenSpec::Not(vec![ref_str.into()]));
         }
-        
-        // Validate wants
-        self.validate_wants(state, capabilities)?;
-        
         Ok(())
     }
     
@@ -385,100 +370,6 @@ impl<'a> NegotiationEngine<'a> {
     }
     
     /// Process have lines and send appropriate ACKs
-    #[cfg(feature = "async")]
-    async fn process_haves_v1<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-        &mut self,
-        reader: &mut StreamingPeekableIter<R>,
-        writer: &mut W,
-        state: &mut NegotiationState,
-        capabilities: &ClientCapabilities,
-    ) -> Result<()> {
-        let mut consecutive_unknowns = 0;
-        let max_consecutive_unknowns = 256; // Git's default
-        
-        while let Some(line) = reader.read_line().await {
-            match line? {
-                line => {
-                    match line.map_err(|e| Error::custom(format!("Packetline decode error: {}", e)))? {
-                        PacketLineRef::Flush => {
-                            break;
-                        }
-                        PacketLineRef::Data(line_data) => {
-                    
-                    if let Some(have_line) = line_data.strip_prefix(b"have ") {
-                        let oid = self.parse_have_line(have_line, state)?;
-                        
-                        if self.repository.has_object(oid) {
-                            // We have this object - it's common
-                            state.common.insert(oid);
-                            state.common_count += 1;
-                            consecutive_unknowns = 0;
-                            
-                            // Send ACK based on multi-ack mode
-                            match capabilities.multi_ack {
-                                MultiAckMode::None => {
-                                    // Send ACK only when we're ready
-                                    if self.should_send_pack(state)? {
-                                        self.send_ack(writer, &oid, AckStatus::Common).await?;
-                                        return Ok(());
-                                    }
-                                }
-                                MultiAckMode::Basic => {
-                                    self.send_ack(writer, &oid, AckStatus::Continue).await?;
-                                }
-                                MultiAckMode::Detailed => {
-                                    if self.should_send_pack(state)? {
-                                        self.send_ack(writer, &oid, AckStatus::Ready).await?;
-                                        return Ok(());
-                                    } else {
-                                        self.send_ack(writer, &oid, AckStatus::Common).await?;
-                                    }
-                                }
-                            }
-                        } else {
-                            // We don't have this object
-                            consecutive_unknowns += 1;
-                            
-                            // If too many unknown objects, consider stopping
-                            if consecutive_unknowns > max_consecutive_unknowns {
-                                break;
-                            }
-                        }
-                        
-                        state.haves.insert(oid);
-                    } else if line_data.trim_ascii() == b"done" {
-                        state.done = true;
-                        break;
-                    }
-                        }
-                        _ => {
-                            // Handle other packet line types if needed
-                        }
-                    }
-                }
-            }
-            
-            state.round += 1;
-        }
-        
-        // Send final response
-        if state.done {
-            if !state.common.is_empty() && self.should_send_pack(state)? {
-                // Send final ACK
-                if let Some(common_oid) = state.common.iter().next() {
-                    self.send_ack(writer, common_oid, AckStatus::Common).await?;
-                }
-            } else {
-                // Send NAK
-                self.send_nak(writer).await?;
-            }
-        }
-        
-        Ok(())
-    }
-
-    /// Process have lines and send appropriate ACKs (sync version)
-    #[cfg(not(feature = "async"))]
     fn process_haves_v1<R: BufRead, W: Write>(
         &mut self,
         reader: &mut StreamingPeekableIter<R>,
@@ -490,57 +381,54 @@ impl<'a> NegotiationEngine<'a> {
         let max_consecutive_unknowns = 256; // Git's default
         
         while let Some(line) = reader.read_line() {
-            match line? {
-                line => {
-                    if matches!(line, PacketLineRef::Flush) {
-                        break;
-                    }
+            let line = line??;
+            if matches!(line, PacketLineRef::Flush) {
+                break;
+            }
+            
+            if let Some(line_data) = line.as_slice() {
+                if let Some(have_line) = line_data.strip_prefix(b"have ") {
+                    let oid = self.parse_have_line(have_line, state)?;
                     
-                    if let Some(line_data) = line.as_slice() {
-                        if let Some(have_line) = line_data.strip_prefix(b"have ") {
-                            let oid = self.parse_have_line(have_line, state)?;
-                            
-                            // Check if we have this object
-                            if self.repository.objects.contains(&oid) {
-                                state.common.insert(oid);
-                                consecutive_unknowns = 0; // Reset counter
-                                
-                                // Send appropriate ACK based on capabilities
-                                match capabilities.multi_ack {
-                                    MultiAckMode::None => {
-                                        // Send ACK only when we're ready
-                                        if self.should_send_pack(state)? {
-                                            self.send_ack(writer, &oid, AckStatus::Common)?;
-                                            return Ok(());
-                                        }
-                                    }
-                                    MultiAckMode::Basic => {
-                                        self.send_ack(writer, &oid, AckStatus::Continue)?;
-                                    }
-                                    MultiAckMode::Detailed => {
-                                        if self.should_send_pack(state)? {
-                                            self.send_ack(writer, &oid, AckStatus::Ready)?;
-                                            return Ok(());
-                                        } else {
-                                            self.send_ack(writer, &oid, AckStatus::Common)?;
-                                        }
-                                    }
-                                }
-                            } else {
-                                consecutive_unknowns += 1;
-                                
-                                // If too many unknown objects, consider stopping
-                                if consecutive_unknowns > max_consecutive_unknowns {
-                                    break;
+                    // Check if we have this object
+                    if self.repository.objects.contains(&oid) {
+                        state.common.insert(oid);
+                        consecutive_unknowns = 0; // Reset counter
+                        
+                        // Send appropriate ACK based on capabilities
+                        match capabilities.multi_ack {
+                            MultiAckMode::None => {
+                                // Send ACK only when we're ready
+                                if self.should_send_pack(state)? {
+                                    self.send_ack(writer, &oid, AckStatus::Common)?;
+                                    return Ok(());
                                 }
                             }
-                            
-                            state.haves.insert(oid);
-                        } else if line_data.trim_ascii() == b"done" {
-                            state.done = true;
+                            MultiAckMode::Basic => {
+                                self.send_ack(writer, &oid, AckStatus::Continue)?;
+                            }
+                            MultiAckMode::Detailed => {
+                                if self.should_send_pack(state)? {
+                                    self.send_ack(writer, &oid, AckStatus::Ready)?;
+                                    return Ok(());
+                                } else {
+                                    self.send_ack(writer, &oid, AckStatus::Common)?;
+                                }
+                            }
+                        }
+                    } else {
+                        consecutive_unknowns += 1;
+                        
+                        // If too many unknown objects, consider stopping
+                        if consecutive_unknowns > max_consecutive_unknowns {
                             break;
                         }
                     }
+                    
+                    state.haves.insert(oid);
+                } else if line_data.trim_ascii() == b"done" {
+                    state.done = true;
+                    break;
                 }
             }
             
@@ -581,28 +469,6 @@ impl<'a> NegotiationEngine<'a> {
     }
     
     /// Send ACK packet
-    #[cfg(feature = "async")]
-    async fn send_ack<W: AsyncWrite + Unpin>(&self, writer: &mut W, oid: &gix_hash::ObjectId, status: AckStatus) -> Result<()> {
-        let status_str = match status {
-            AckStatus::Common => "",
-            AckStatus::Continue => " continue", 
-            AckStatus::Ready => " ready",
-        };
-        
-        let response = format!("ACK {}{}\n", oid.to_hex(), status_str);
-        gix_packetline::encode::data_to_write(response.as_bytes(), writer).await?;
-        Ok(())
-    }
-    
-    /// Send NAK packet
-    #[cfg(feature = "async")]
-    async fn send_nak<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        gix_packetline::encode::data_to_write(b"NAK\n", writer).await?;
-        Ok(())
-    }
-
-    /// Send ACK packet (sync version)
-    #[cfg(not(feature = "async"))]
     fn send_ack<W: Write>(&self, writer: &mut W, oid: &gix_hash::ObjectId, status: AckStatus) -> Result<()> {
         let status_str = match status {
             AckStatus::Common => "",
@@ -615,8 +481,7 @@ impl<'a> NegotiationEngine<'a> {
         Ok(())
     }
     
-    /// Send NAK packet (sync version)
-    #[cfg(not(feature = "async"))]
+    /// Send NAK packet
     fn send_nak<W: Write>(&self, writer: &mut W) -> Result<()> {
         gix_packetline::encode::data_to_write(b"NAK\n", writer)?;
         Ok(())

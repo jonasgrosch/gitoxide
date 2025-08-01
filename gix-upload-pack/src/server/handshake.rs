@@ -9,11 +9,10 @@ use crate::{
     types::*,
 };
 use bstr::{BStr, ByteSlice};
-use gix::Repository;
+use gix::{Repository, ObjectId};
 use gix_packetline::PacketLineRef;
-use futures_lite::AsyncWrite;
-
-type AsyncWriter = dyn AsyncWrite + Unpin;
+use std::io::Write;
+// Async support removed - now fully synchronous
 
 /// Handshake manager for protocol sessions
 pub struct HandshakeManager<'a> {
@@ -28,7 +27,7 @@ impl<'a> HandshakeManager<'a> {
     }
     
     /// Perform initial handshake for protocol V1
-    pub async fn handshake_v1<W: AsyncWrite + Unpin>(
+    pub fn handshake_v1<W: Write>(
         &self,
         writer: &mut W,
         session: &mut SessionContext,
@@ -41,27 +40,28 @@ impl<'a> HandshakeManager<'a> {
         
         if refs.is_empty() {
             // No refs case - send capabilities only
-            self.write_capabilities_only_line(writer, capabilities).await?;
+            self.write_capabilities_only_line(writer, capabilities)?;
         } else {
             // Send first ref with capabilities
             let first_ref = &refs[0];
-            self.write_ref_with_capabilities(writer, first_ref, capabilities).await?;
+            self.write_ref_with_capabilities(writer, first_ref, capabilities)?;
             
             // Send remaining refs without capabilities
             for reference in refs.iter().skip(1) {
-                self.write_ref_line(writer, reference).await?;
+                self.write_ref_line(writer, reference)?;
             }
             
             // Send peeled refs for tags
             for reference in &refs {
-                if let Some(peeled) = reference.peeled_oid() {
-                    self.write_peeled_ref(writer, reference, &peeled).await?;
+                let (_, _, peeled) = reference.unpack();
+                if let Some(peeled_oid) = peeled {
+                    self.write_peeled_ref(writer, reference, peeled_oid)?;
                 }
             }
         }
         
         // End advertisement with flush packet
-        PacketLineRef::Flush.write_to(writer).await?;
+        PacketLineRef::Flush.write_to(writer)?;
         
         // Update session with advertised capabilities
         session.server_capabilities = Some(capabilities.clone());
@@ -70,7 +70,7 @@ impl<'a> HandshakeManager<'a> {
     }
     
     /// Perform initial handshake for protocol V2
-    pub async fn handshake_v2<W: AsyncWrite + Unpin>(
+    pub fn handshake_v2<W: Write>(
         &self,
         writer: &mut W,
         session: &mut SessionContext,
@@ -78,10 +78,10 @@ impl<'a> HandshakeManager<'a> {
         let capabilities = &self.options.capabilities;
         
         // Send capability advertisement
-        self.write_v2_capabilities(writer, capabilities).await?;
+        self.write_v2_capabilities(writer, capabilities)?;
         
         // End with flush
-        PacketLineRef::Flush.write_to(writer).await?;
+        PacketLineRef::Flush.write_to(writer)?;
         
         // Update session
         session.server_capabilities = Some(capabilities.clone());
@@ -154,9 +154,6 @@ impl<'a> HandshakeManager<'a> {
             }
         }
         
-        // Sort refs by name for consistent output
-        refs.sort_by(|a, b| a.ref_name().cmp(b.ref_name()));
-        
         Ok(refs)
     }
     
@@ -202,52 +199,59 @@ impl<'a> HandshakeManager<'a> {
     }
     
     /// Write a reference line with capabilities
-    async fn write_ref_with_capabilities<W: AsyncWrite + Unpin>(
+    fn write_ref_with_capabilities<W: Write>(
         &self,
         writer: &mut W,
         reference: &Reference,
         capabilities: &ServerCapabilities,
     ) -> Result<()> {
         let caps_str = self.format_capabilities_v1(capabilities);
+        let (name, target, _) = reference.unpack();
+        let null_oid = ObjectId::null(gix_hash::Kind::Sha1);
+        let target_oid = target.unwrap_or(&null_oid);
         let line = format!(
             "{} {}\0{}\n",
-            reference.target_oid().to_hex(),
-            reference.ref_name().to_str_lossy(),
+            target_oid.to_hex(),
+            name.to_str_lossy(),
             caps_str
         );
-        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer).await?;
+        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer)?;
         Ok(())
     }
     
     /// Write a reference line without capabilities
-    async fn write_ref_line<W: AsyncWrite + Unpin>(&self, writer: &mut W, reference: &Reference) -> Result<()> {
+    fn write_ref_line<W: Write>(&self, writer: &mut W, reference: &Reference) -> Result<()> {
+        let (name, target, _) = reference.unpack();
+        let null_oid = ObjectId::null(gix_hash::Kind::Sha1);
+        let target_oid = target.unwrap_or(&null_oid);
         let line = format!(
             "{} {}\n",
-            reference.target_oid().to_hex(),
-            reference.ref_name().to_str_lossy()
+            target_oid.to_hex(),
+            name.to_str_lossy()
         );
-        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer).await?;
+        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer)?;
         Ok(())
     }
     
     /// Write a peeled reference line
-    async fn write_peeled_ref<W: AsyncWrite + Unpin>(
+    fn write_peeled_ref<W: Write>(
         &self,
         writer: &mut W,
         reference: &Reference,
-        peeled: &gix_hash::ObjectId,
+        peeled: &gix_hash::oid,
     ) -> Result<()> {
+        let (name, _, _) = reference.unpack();
         let line = format!(
             "{} {}^{{}}\n",
             peeled.to_hex(),
-            reference.ref_name().to_str_lossy()
+            name.to_str_lossy()
         );
-        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer).await?;
+        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer)?;
         Ok(())
     }
     
     /// Write capabilities-only line for repositories with no refs
-    async fn write_capabilities_only_line<W: AsyncWrite + Unpin>(
+    fn write_capabilities_only_line<W: Write>(
         &self,
         writer: &mut W,
         capabilities: &ServerCapabilities,
@@ -255,31 +259,31 @@ impl<'a> HandshakeManager<'a> {
         let caps_str = self.format_capabilities_v1(capabilities);
         let null_oid = gix_hash::ObjectId::null(self.repository.object_hash());
         let line = format!("{} capabilities^{{}}\0{}\n", null_oid.to_hex(), caps_str);
-        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer).await?;
+        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer)?;
         Ok(())
     }
     
     /// Write V2 capability advertisement
-    async fn write_v2_capabilities<W: AsyncWrite + Unpin>(
+    fn write_v2_capabilities<W: Write>(
         &self,
         writer: &mut W,
         capabilities: &ServerCapabilities,
     ) -> Result<()> {
         // Version line
-        gix_packetline::encode::data_to_write(b"version 2\n", &mut *writer).await?;
+        gix_packetline::encode::data_to_write(b"version 2\n", &mut *writer)?;
         
         // Agent capability
         let agent_line = format!("agent={}\n", capabilities.agent.to_str_lossy());
-        gix_packetline::encode::data_to_write(agent_line.as_bytes(), &mut *writer).await?;
+        gix_packetline::encode::data_to_write(agent_line.as_bytes(), &mut *writer)?;
         
         // Object format capabilities
         for format in &capabilities.object_format {
             let format_line = format!("object-format={}\n", format);
-            gix_packetline::encode::data_to_write(format_line.as_bytes(), &mut *writer).await?;
+            gix_packetline::encode::data_to_write(format_line.as_bytes(), &mut *writer)?;
         }
         
         // ls-refs command
-        gix_packetline::encode::data_to_write(b"ls-refs=unborn\n", &mut *writer).await?;
+        gix_packetline::encode::data_to_write(b"ls-refs=unborn\n", &mut *writer)?;
         
         // fetch command with sub-capabilities
         let mut fetch_caps = Vec::new();
@@ -292,10 +296,9 @@ impl<'a> HandshakeManager<'a> {
             fetch_caps.push("filter");
         }
         
-        match capabilities.side_band {
-            SideBandMode::None => {}
-            SideBandMode::Basic => fetch_caps.push("sideband"),
-            SideBandMode::SideBand64k => fetch_caps.push("sideband-all"),
+        // Add v2-specific sideband capabilities
+        for cap in capabilities.side_band.to_v2_capability_strings() {
+            fetch_caps.push(cap);
         }
         
         if capabilities.packfile_uris {
@@ -311,20 +314,20 @@ impl<'a> HandshakeManager<'a> {
         } else {
             format!("fetch={}\n", fetch_caps.join(" "))
         };
-        gix_packetline::encode::data_to_write(fetch_line.as_bytes(), &mut *writer).await?;
+        gix_packetline::encode::data_to_write(fetch_line.as_bytes(), &mut *writer)?;
         
         // server-info command
-        gix_packetline::encode::data_to_write(b"server-info\n", &mut *writer).await?;
+        gix_packetline::encode::data_to_write(b"server-info\n", &mut *writer)?;
         
         // object-info command if enabled
         if capabilities.object_info {
-            gix_packetline::encode::data_to_write(b"object-info\n", &mut *writer).await?;
+            gix_packetline::encode::data_to_write(b"object-info\n", &mut *writer)?;
         }
         
         // Session ID if available
         if let Some(ref session_id) = capabilities.session_id {
             let session_line = format!("session-id={}\n", session_id.to_str_lossy());
-            gix_packetline::encode::data_to_write(session_line.as_bytes(), writer).await?;
+            gix_packetline::encode::data_to_write(session_line.as_bytes(), writer)?;
         }
         
         Ok(())
@@ -346,11 +349,7 @@ impl<'a> HandshakeManager<'a> {
             caps.push("thin-pack".to_string());
         }
         
-        match capabilities.side_band {
-            SideBandMode::None => {}
-            SideBandMode::Basic => caps.push("side-band".to_string()),
-            SideBandMode::SideBand64k => caps.push("side-band-64k".to_string()),
-        }
+        caps.extend(capabilities.side_band.to_capability_strings().iter().map(|s| s.to_string()));
         
         if capabilities.ofs_delta {
             caps.push("ofs-delta".to_string());

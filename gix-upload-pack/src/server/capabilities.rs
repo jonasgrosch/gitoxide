@@ -189,8 +189,9 @@ impl<'a> CapabilityManager<'a> {
                 "multi_ack" => client_caps.multi_ack = MultiAckMode::Basic,
                 "multi_ack_detailed" => client_caps.multi_ack = MultiAckMode::Detailed,
                 "thin-pack" => client_caps.thin_pack = true,
-                "side-band" => client_caps.side_band = SideBandMode::Basic,
-                "side-band-64k" => client_caps.side_band = SideBandMode::SideBand64k,
+                cap if SideBandMode::from_capability_string(cap).is_some() => {
+                    client_caps.side_band = SideBandMode::from_capability_string(cap).unwrap();
+                }
                 "ofs-delta" => client_caps.ofs_delta = true,
                 "include-tag" => client_caps.include_tag = true,
                 "no-progress" => client_caps.no_progress = true,
@@ -230,11 +231,8 @@ impl<'a> CapabilityManager<'a> {
             cap_strings.push("thin-pack".to_string());
         }
         
-        match caps.side_band {
-            SideBandMode::None => {}
-            SideBandMode::Basic => cap_strings.push("side-band".to_string()),
-            SideBandMode::SideBand64k => cap_strings.push("side-band-64k".to_string()),
-        }
+        // Side-band capabilities
+        cap_strings.extend(caps.side_band.to_capability_strings().iter().map(|s| s.to_string()));
         
         if caps.ofs_delta {
             cap_strings.push("ofs-delta".to_string());

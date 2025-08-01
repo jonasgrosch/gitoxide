@@ -16,10 +16,7 @@ use gix_pack::Find;
 use gix_packetline::{PacketLineRef, StreamingPeekableIter};
 use std::io::{BufRead, BufReader, Read, Write};
 
-#[cfg(feature = "async")]
-use futures_lite::io::{AsyncRead, AsyncWrite};
-#[cfg(feature = "async")]
-use futures_lite::AsyncBufReadExt;
+// Async support removed - now fully synchronous
 
 /// Protocol V1 handler
 pub struct Handler<'a> {
@@ -34,8 +31,7 @@ impl<'a> Handler<'a> {
     }
     
     /// Advertise references and capabilities
-    #[cfg(feature = "async")]
-    async fn advertise_refs<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+    fn advertise_refs<W: Write>(&self, writer: &mut W) -> Result<()> {
         let capabilities = &self.options.capabilities;
         
         // Get all references
@@ -43,23 +39,23 @@ impl<'a> Handler<'a> {
         
         if refs.is_empty() {
             // Send null capabilities line when no refs
-            self.write_capabilities_line(writer, &gix_hash::ObjectId::null(gix_hash::Kind::Sha1), "capabilities^{}", capabilities).await?;
+            self.write_capabilities_line(writer, &gix_hash::ObjectId::null(gix_hash::Kind::Sha1), "capabilities^{}", capabilities)?;
         } else {
             let mut first = true;
             for reference in refs {
                 if first {
                     // First ref includes capabilities
-                    self.write_ref_with_capabilities(writer, &reference, capabilities).await?;
+                    self.write_ref_with_capabilities(writer, &reference, capabilities)?;
                     first = false;
                 } else {
                     // Subsequent refs without capabilities
-                    self.write_ref_line(writer, &reference).await?;
+                    self.write_ref_line(writer, &reference)?;
                 }
             }
         }
         
         // Send flush packet to end advertisement
-        gix_packetline::PacketLineRef::Flush.write_to(writer).await?;
+        gix_packetline::PacketLineRef::Flush.write_to(writer)?;
         Ok(())
     }
     
@@ -175,9 +171,14 @@ impl<'a> Handler<'a> {
             eprintln!("Debug: HEAD not added - head_target: {:?}, head_symref_target: {:?}", head_target, head_symref_target);
         }
         
-        // Sort refs for consistent output (but keep HEAD first if present)
-        let head_ref = if !refs.is_empty() && refs[0].ref_name() == "HEAD" {
-            Some(refs.remove(0))
+        // Sort refs for consistent output (but keep HEAD first if present) 
+        let head_ref = if !refs.is_empty() {
+            let (ref_name, _, _) = refs[0].unpack();
+            if ref_name == "HEAD" {
+                Some(refs.remove(0))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -191,33 +192,6 @@ impl<'a> Handler<'a> {
     }
     
     /// Write a reference line with capabilities
-    #[cfg(feature = "async")]
-    async fn write_ref_with_capabilities<W: AsyncWrite + Unpin>(
-        &self,
-        writer: &mut W,
-        reference: &Reference,
-        capabilities: &ServerCapabilities,
-    ) -> Result<()> {
-        let caps_str = self.format_capabilities(capabilities);
-        let line = format!(
-            "{} {}\0{}\n",
-            reference.target_oid().to_hex(),
-            reference.ref_name().to_str_lossy(),
-            caps_str
-        );
-        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer).await?;
-        
-        // If there's a peeled value, send it too
-        if let Some(peeled) = reference.peeled_oid() {
-            let peeled_line = format!("{} {}^{{}}\n", peeled.to_hex(), reference.ref_name().to_str_lossy());
-            gix_packetline::encode::data_to_write(peeled_line.as_bytes(), writer).await?;
-        }
-        
-        Ok(())
-    }
-
-    /// Write a reference line with capabilities (sync version)
-    #[cfg(not(feature = "async"))]
     fn write_ref_with_capabilities<W: Write>(
         &self,
         writer: &mut W,
@@ -225,17 +199,19 @@ impl<'a> Handler<'a> {
         capabilities: &ServerCapabilities,
     ) -> Result<()> {
         let caps_str = self.format_capabilities(capabilities);
+        let (ref_name, target_oid, peeled) = reference.unpack();
+        let target_oid = target_oid.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Unborn reference has no target"))?;
         let line = format!(
             "{} {}\0{}\n",
-            reference.target_oid().to_hex(),
-            reference.ref_name().to_str_lossy(),
+            target_oid.to_hex(),
+            ref_name.to_str_lossy(),
             caps_str
         );
         gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer)?;
         
         // If there's a peeled value, send it too
-        if let Some(peeled) = reference.peeled_oid() {
-            let peeled_line = format!("{} {}^{{}}\n", peeled.to_hex(), reference.ref_name().to_str_lossy());
+        if let Some(peeled_oid) = peeled {
+            let peeled_line = format!("{} {}^{{}}\n", peeled_oid.to_hex(), ref_name.to_str_lossy());
             gix_packetline::encode::data_to_write(peeled_line.as_bytes(), writer)?;
         }
         
@@ -243,29 +219,15 @@ impl<'a> Handler<'a> {
     }
     
     /// Write a reference line without capabilities
-    #[cfg(feature = "async")]
-    async fn write_ref_line<W: AsyncWrite + Unpin>(&self, writer: &mut W, reference: &Reference) -> Result<()> {
-        let line = format!("{} {}\n", reference.target_oid().to_hex(), reference.ref_name().to_str_lossy());
-        gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer).await?;
-        
-        // If there's a peeled value, send it too
-        if let Some(peeled) = reference.peeled_oid() {
-            let peeled_line = format!("{} {}^{{}}\n", peeled.to_hex(), reference.ref_name().to_str_lossy());
-            gix_packetline::encode::data_to_write(peeled_line.as_bytes(), writer).await?;
-        }
-        
-        Ok(())
-    }
-
-    /// Write a reference line without capabilities (sync version)
-    #[cfg(not(feature = "async"))]
     fn write_ref_line<W: Write>(&self, writer: &mut W, reference: &Reference) -> Result<()> {
-        let line = format!("{} {}\n", reference.target_oid().to_hex(), reference.ref_name().to_str_lossy());
+        let (ref_name, target_oid, peeled) = reference.unpack();
+        let target_oid = target_oid.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Unborn reference has no target"))?;
+        let line = format!("{} {}\n", target_oid.to_hex(), ref_name.to_str_lossy());
         gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer)?;
         
         // If there's a peeled value, send it too
-        if let Some(peeled) = reference.peeled_oid() {
-            let peeled_line = format!("{} {}^{{}}\n", peeled.to_hex(), reference.ref_name().to_str_lossy());
+        if let Some(peeled_oid) = peeled {
+            let peeled_line = format!("{} {}^{{}}\n", peeled_oid.to_hex(), ref_name.to_str_lossy());
             gix_packetline::encode::data_to_write(peeled_line.as_bytes(), writer)?;
         }
         
@@ -273,22 +235,6 @@ impl<'a> Handler<'a> {
     }
     
     /// Write capabilities-only line for empty repositories
-    #[cfg(feature = "async")]
-    async fn write_capabilities_line<W: AsyncWrite + Unpin>(
-        &self,
-        writer: &mut W,
-        oid: &gix_hash::ObjectId,
-        refname: &str,
-        capabilities: &ServerCapabilities,
-    ) -> Result<()> {
-        let caps_str = self.format_capabilities(capabilities);
-        let line = format!("{} {}\0{}\n", oid.to_hex(), refname, caps_str);
-        gix_packetline::encode::data_to_write(line.as_bytes(), writer).await?;
-        Ok(())
-    }
-
-    /// Write capabilities-only line for empty repositories (sync version)
-    #[cfg(not(feature = "async"))]
     fn write_capabilities_line<W: Write>(
         &self,
         writer: &mut W,
@@ -407,26 +353,6 @@ impl<'a> Handler<'a> {
     }
     
     /// Handle want/have negotiation phase
-    #[cfg(feature = "async")]
-    async fn handle_negotiation<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-        &self,
-        reader: &mut R,
-        writer: &mut W,
-        session: &mut SessionContext,
-    ) -> Result<()> {
-        let mut line_reader = gix_packetline::StreamingPeekableIter::new(reader, &[PacketLineRef::Flush], false);
-        
-        // Phase 1: Collect wants and initial capabilities
-        self.collect_wants(&mut line_reader, session).await?;
-        
-        // Phase 2: Handle haves and send acks
-        self.handle_haves(&mut line_reader, writer, session).await?;
-        
-        Ok(())
-    }
-
-    /// Handle want/have negotiation phase (sync version)
-    #[cfg(not(feature = "async"))]
     fn handle_negotiation<R: BufRead, W: Write>(
         &self,
         reader: &mut R,
@@ -445,13 +371,12 @@ impl<'a> Handler<'a> {
     }
     
     /// Collect want lines from client
-    #[cfg(feature = "async")]
-    async fn collect_wants<R: AsyncRead + Unpin>(
+    fn collect_wants<R: BufRead>(
         &self,
         reader: &mut StreamingPeekableIter<R>,
         session: &mut SessionContext,
     ) -> Result<()> {
-        while let Some(line_result) = reader.read_line().await {
+        while let Some(line_result) = reader.read_line() {
             let line = line_result??;
             if matches!(line, gix_packetline::PacketLineRef::Flush) {
                 break;
@@ -506,8 +431,9 @@ impl<'a> Handler<'a> {
                 "multi_ack" => capabilities.multi_ack = MultiAckMode::Basic,
                 "multi_ack_detailed" => capabilities.multi_ack = MultiAckMode::Detailed,
                 "thin-pack" => capabilities.thin_pack = true,
-                "side-band" => capabilities.side_band = SideBandMode::Basic,
-                "side-band-64k" => capabilities.side_band = SideBandMode::SideBand64k,
+                cap if SideBandMode::from_capability_string(cap).is_some() => {
+                    capabilities.side_band = SideBandMode::from_capability_string(cap).unwrap();
+                }
                 "ofs-delta" => capabilities.ofs_delta = true,
                 "include-tag" => capabilities.include_tag = true,
                 "no-progress" => capabilities.no_progress = true,
@@ -591,8 +517,7 @@ impl<'a> Handler<'a> {
     }
     
     /// Handle have/ack negotiation loop
-    #[cfg(feature = "async")]
-    async fn handle_haves<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    fn handle_haves<R: BufRead, W: Write>(
         &self,
         reader: &mut StreamingPeekableIter<R>,
         writer: &mut W,
@@ -600,7 +525,7 @@ impl<'a> Handler<'a> {
     ) -> Result<()> {
         let mut common_found = false;
         
-        while let Some(line_result) = reader.read_line().await {
+        while let Some(line_result) = reader.read_line() {
             let line = line_result??;
             if matches!(line, gix_packetline::PacketLineRef::Flush) {
                 break;
@@ -619,18 +544,18 @@ impl<'a> Handler<'a> {
                     match session.capabilities.multi_ack {
                         MultiAckMode::None => {
                             if self.can_send_pack(session)? {
-                                self.send_ack(writer, &oid, AckStatus::Common).await?;
+                                self.send_ack(writer, &oid, AckStatus::Common)?;
                             }
                         }
                         MultiAckMode::Basic => {
-                            self.send_ack(writer, &oid, AckStatus::Continue).await?;
+                            self.send_ack(writer, &oid, AckStatus::Continue)?;
                         }
                         MultiAckMode::Detailed => {
                             if self.can_send_pack(session)? {
-                                self.send_ack(writer, &oid, AckStatus::Ready).await?;
+                                self.send_ack(writer, &oid, AckStatus::Ready)?;
                                 return Ok(());
                             } else {
-                                self.send_ack(writer, &oid, AckStatus::Common).await?;
+                                self.send_ack(writer, &oid, AckStatus::Common)?;
                             }
                         }
                     }
@@ -649,11 +574,11 @@ impl<'a> Handler<'a> {
             if common_found && self.can_send_pack(session)? {
                 // Send final ACK
                 if let Some(common_oid) = session.negotiation.common.iter().next() {
-                    self.send_ack(writer, common_oid, AckStatus::Common).await?;
+                    self.send_ack(writer, common_oid, AckStatus::Common)?;
                 }
             } else {
                 // Send NAK
-                self.send_nak(writer).await?;
+                self.send_nak(writer)?;
             }
         }
         
@@ -680,21 +605,6 @@ impl<'a> Handler<'a> {
     }
     
     /// Send ACK response
-    #[cfg(feature = "async")]
-    async fn send_ack<W: AsyncWrite + Unpin>(&self, writer: &mut W, oid: &gix_hash::ObjectId, status: AckStatus) -> Result<()> {
-        let status_str = match status {
-            AckStatus::Common => "",
-            AckStatus::Continue => " continue",
-            AckStatus::Ready => " ready",
-        };
-        
-        let response = format!("ACK {}{}\n", oid.to_hex(), status_str);
-        gix_packetline::encode::data_to_write(response.as_bytes(), writer).await?;
-        Ok(())
-    }
-
-    /// Send ACK response (sync version)
-    #[cfg(not(feature = "async"))]
     fn send_ack<W: Write>(&self, writer: &mut W, oid: &gix_hash::ObjectId, status: AckStatus) -> Result<()> {
         let status_str = match status {
             AckStatus::Common => "",
@@ -708,29 +618,12 @@ impl<'a> Handler<'a> {
     }
     
     /// Send NAK response
-    #[cfg(feature = "async")]
-    async fn send_nak<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        gix_packetline::encode::data_to_write(b"NAK\n", writer).await?;
-        Ok(())
-    }
-
-    /// Send NAK response (sync version)
-    #[cfg(not(feature = "async"))]
     fn send_nak<W: Write>(&self, writer: &mut W) -> Result<()> {
         gix_packetline::encode::data_to_write(b"NAK\n", writer)?;
         Ok(())
     }
     
     /// Generate and send pack file
-    #[cfg(feature = "async")]
-    async fn send_pack<W: AsyncWrite + Unpin>(&self, writer: &mut W, session: &SessionContext) -> Result<()> {
-        let pack_generator = pack_generation::PackGenerator::new(self.repository, self.options);
-        pack_generator.generate_pack(writer, session).await?;
-        Ok(())
-    }
-
-    /// Generate and send pack file (sync version)
-    #[cfg(not(feature = "async"))]
     fn send_pack<W: Write>(&self, writer: &mut W, session: &SessionContext) -> Result<()> {
         let pack_generator = pack_generation::PackGenerator::new(self.repository, self.options);
         pack_generator.generate_pack(writer, session)?;
@@ -738,39 +631,6 @@ impl<'a> Handler<'a> {
     }
 }
 
-#[cfg(feature = "async")]
-impl<'a> ProtocolHandler for Handler<'a> {
-    async fn handle_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-        &mut self,
-        input: R,
-        mut output: W,
-        session: &mut SessionContext,
-    ) -> Result<()> {
-        let mut buffered_input = futures_lite::io::BufReader::new(input);
-        
-        if self.options.advertise_refs {
-            // Just advertise refs and exit (for git ls-remote, etc.)
-            self.advertise_refs(&mut output).await?;
-        } else {
-            // Full upload-pack session
-            
-            // Step 1: Advertise refs and capabilities
-            self.advertise_refs(&mut output).await?;
-            
-            // Step 2: Handle negotiation
-            self.handle_negotiation(&mut buffered_input, &mut output, session).await?;
-            
-            // Step 3: Generate and send pack
-            if !session.negotiation.wants.is_empty() && session.negotiation.done {
-                self.send_pack(&mut output, session).await?;
-            }
-        }
-        
-        Ok(())
-    }
-}
-
-#[cfg(not(feature = "async"))]
 impl<'a> ProtocolHandler for Handler<'a> {
     fn handle_session<R: Read, W: Write>(
         &mut self,

@@ -30,8 +30,10 @@
 //!     
 //! let mut server = Server::new("/path/to/repo", options)?;
 //! 
-//! // Handle upload-pack protocol
-//! server.serve(stdin(), stdout())?;
+//! // Handle upload-pack protocol (now synchronous)
+//! let stdin = stdin();
+//! let stdout = stdout();
+//! server.serve(stdin.lock(), stdout.lock())?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
