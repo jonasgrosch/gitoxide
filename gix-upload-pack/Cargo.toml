@@ -20,11 +20,11 @@ path = "examples/simple_server.rs"
 [dependencies]
 # Core gitoxide crates
 gix = { version = "0.73", path = "../gix", default-features = false, features = ["revision"] }
-gix-protocol = { version = "0.51", path = "../gix-protocol", features = ["handshake", "fetch"] }
-gix-transport = { version = "0.48.0", path = "../gix-transport", features = ["blocking-client"] }
+gix-protocol = { version = "0.51", path = "../gix-protocol", features = ["handshake", "fetch", "async-client"] }
+gix-transport = { version = "0.48.0", path = "../gix-transport" }
 gix-pack = { version = "0.60.0", path = "../gix-pack", features = ["streaming-input"] }
 gix-packetline = { version = "0.19.1", path = "../gix-packetline" }
-gix-packetline-blocking = { version = "0.19.1", path = "../gix-packetline-blocking" }
+gix-shallow = { version = "0.5.0", path = "../gix-shallow" }
 gix-hash = { version = "0.19.0", path = "../gix-hash" }
 gix-object = { version = "0.50.0", path = "../gix-object" }
 gix-ref = { version = "0.53.0", path = "../gix-ref" }
@@ -58,11 +58,11 @@ predicates = "3.0"
 serial_test = "3.0"
 
 [features]
-default = ["blocking"]
+default = ["async"]
 
 # Transport features
-blocking = ["gix-transport/blocking-client"]
-async = ["gix-transport/async-client", "futures-lite", "async-trait"]
+blocking = ["gix-transport/blocking-client", "gix-packetline/blocking-io"]
+async = ["gix-transport/async-client", "gix-packetline/async-io", "futures-lite", "async-trait"]
 
 # Protocol features  
 serde = ["gix-protocol/serde", "gix-transport/serde"]

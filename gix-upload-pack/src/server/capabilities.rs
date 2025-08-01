@@ -8,12 +8,14 @@ use crate::{
     error::{Error, Result},
     types::*,
 };
-use bstr::{BStr, BString, ByteSlice};
+use bstr::ByteSlice;
 use gix::Repository;
-use std::collections::HashMap;
+use gix_protocol::Command;
+use gix_transport::client::Capabilities;
 
 /// Capability manager for handling server and client capabilities
 pub struct CapabilityManager<'a> {
+    #[allow(dead_code)]
     repository: &'a Repository,
     options: &'a ServerOptions,
 }
@@ -24,456 +26,286 @@ impl<'a> CapabilityManager<'a> {
         Self { repository, options }
     }
     
-    /// Get the default server capabilities based on repository and configuration
-    pub fn default_server_capabilities(&self) -> ServerCapabilities {
-        let mut caps = ServerCapabilities::default();
+    /// Build server capabilities using gix-protocol defaults
+    pub fn build_server_capabilities(&self, protocol_version: ProtocolVersion) -> Result<Capabilities> {
+        match protocol_version {
+            ProtocolVersion::V0 | ProtocolVersion::V1 => {
+                // For V1, build capabilities using gix-protocol defaults
+                let fetch_command = Command::Fetch;
+                let default_features = fetch_command.default_features(protocol_version, &Capabilities::default());
+                
+                // Build capability string from default features
+                let caps_string = self.build_v1_capabilities_from_features(&default_features);
+                let full_string = format!("\0{}", caps_string);
+                
+                Capabilities::from_bytes(full_string.as_bytes())
+                    .map(|(caps, _)| caps)
+                    .map_err(|e| Error::ProtocolParsing(format!("Failed to parse V1 capabilities: {}", e)))
+            }
+            ProtocolVersion::V2 => {
+                // For V2, build capabilities using gix-protocol command features
+                let capabilities_string = self.build_v2_capabilities_with_commands();
+                let full_string = format!("version 2\n{}", capabilities_string);
+                Capabilities::from_lines(full_string.into())
+                    .map_err(|e| Error::ProtocolParsing(format!("Failed to parse V2 capabilities: {}", e)))
+            }
+        }
+    }
+    
+    /// Build V1 capabilities from gix-protocol features
+    fn build_v1_capabilities_from_features(&self, features: &[(&str, Option<std::borrow::Cow<'static, str>>)]) -> String {
+        let mut cap_strings = Vec::new();
         
-        // Multi-ack capability - always support detailed for better performance
-        caps.multi_ack = MultiAckMode::Detailed;
+        // Add protocol-defined features
+        for (feature, value) in features {
+            if let Some(val) = value {
+                cap_strings.push(format!("{}={}", feature, val));
+            } else {
+                cap_strings.push(feature.to_string());
+            }
+        }
         
-        // Thin pack support
-        caps.thin_pack = true;
-        
-        // Side-band support for progress and error reporting
-        caps.side_band = SideBandMode::SideBand64k;
-        
-        // OFS delta support for more efficient packs
-        caps.ofs_delta = true;
-        
-        // Shallow support
-        caps.shallow = true;
-        caps.deepen_since = true;
-        caps.deepen_not = true;
-        caps.deepen_relative = self.options.allow_deepen_relative;
-        
-        // Progress reporting (can be disabled by client)
-        caps.no_progress = false;
-        
-        // Tag inclusion
-        caps.include_tag = true;
-        
-        // Object filtering
-        caps.filter = self.options.allow_filter;
-        
-        // SHA1-in-want capabilities
-        caps.allow_tip_sha1_in_want = self.options.allow_tip_sha1_in_want;
-        caps.allow_reachable_sha1_in_want = self.options.allow_reachable_sha1_in_want;
-        caps.allow_any_sha1_in_want = self.options.allow_any_sha1_in_want;
-        
-        // No-done capability for faster negotiation
-        caps.no_done = true;
+        // Add server-specific capabilities
+        if self.options.allow_filter {
+            cap_strings.push("filter".to_string());
+        }
+        if self.options.allow_tip_sha1_in_want {
+            cap_strings.push("allow-tip-sha1-in-want".to_string());
+        }
+        if self.options.allow_reachable_sha1_in_want {
+            cap_strings.push("allow-reachable-sha1-in-want".to_string());
+        }
         
         // Agent string
-        caps.agent = self.get_agent_string();
+        cap_strings.push(format!("agent=git/gitoxide-{}", crate::VERSION));
         
-        // Object format support
-        caps.object_format = self.get_supported_object_formats().into();
-        
-        // Session ID for request correlation
-        caps.session_id = self.generate_session_id();
-        
-        // Protocol V2 specific capabilities
-        caps.packfile_uris = self.options.allow_packfile_uris;
-        caps.wait_for_done = true;
-        caps.object_info = self.options.enable_object_info;
-        
-        caps
+        cap_strings.join(" ")
     }
     
-    /// Negotiate capabilities with client
-    pub fn negotiate_capabilities(
-        &self,
-        client_caps: &ClientCapabilities,
-    ) -> Result<(ServerCapabilities, ClientCapabilities)> {
-        let mut server_caps = self.default_server_capabilities();
-        let mut negotiated_client_caps = client_caps.clone();
+    /// Build V2 capabilities with proper command integration
+    fn build_v2_capabilities_with_commands(&self) -> String {
+        let mut caps = Vec::new();
         
-        // Negotiate multi-ack mode
-        server_caps.multi_ack = match (server_caps.multi_ack, client_caps.multi_ack) {
-            (_, MultiAckMode::Detailed) => MultiAckMode::Detailed,
-            (_, MultiAckMode::Basic) => MultiAckMode::Basic,
-            _ => MultiAckMode::None,
-        };
+        // Agent capability
+        caps.push(format!("agent=git/gitoxide-{}", crate::VERSION));
         
-        // Negotiate side-band mode
-        server_caps.side_band = match (server_caps.side_band, client_caps.side_band) {
-            (SideBandMode::SideBand64k, SideBandMode::SideBand64k) => SideBandMode::SideBand64k,
-            (_, SideBandMode::Basic) | (SideBandMode::Basic, _) => SideBandMode::Basic,
-            _ => SideBandMode::None,
-        };
+        // Object format
+        caps.push("object-format=sha1".to_string());
         
-        // Capability intersections
-        server_caps.thin_pack = server_caps.thin_pack && client_caps.thin_pack;
-        server_caps.ofs_delta = server_caps.ofs_delta && client_caps.ofs_delta;
-        server_caps.include_tag = server_caps.include_tag && client_caps.include_tag;
-        server_caps.no_progress = server_caps.no_progress || client_caps.no_progress;
+        // Get default capabilities for V2
+        let default_caps = Capabilities::default();
         
-        // Shallow capabilities
-        if !client_caps.shallow {
-            server_caps.shallow = false;
-            server_caps.deepen_since = false;
-            server_caps.deepen_not = false;
-            server_caps.deepen_relative = false;
-        }
+        // Fetch command with its features
+        let fetch_command = Command::Fetch;
+        let fetch_features = fetch_command.default_features(ProtocolVersion::V2, &default_caps);
+        let mut fetch_cap_strings = Vec::new();
         
-        // Filter support
-        if !server_caps.filter {
-            negotiated_client_caps.filter = None;
-        }
-        
-        // SHA1-in-want capabilities
-        if !server_caps.allow_tip_sha1_in_want {
-            negotiated_client_caps.allow_tip_sha1_in_want = false;
-        }
-        if !server_caps.allow_reachable_sha1_in_want {
-            negotiated_client_caps.allow_reachable_sha1_in_want = false;
-        }
-        
-        // Object format negotiation
-        if let Some(client_format) = client_caps.object_format {
-            if !server_caps.object_format.contains(&client_format) {
-                return Err(Error::UnsupportedObjectFormat { 
-                    format: client_format.to_string() 
-                });
+        for (feature, _) in &fetch_features {
+            if *feature != "fetch" { // Don't include the command name itself
+                fetch_cap_strings.push(feature.to_string());
             }
-            // Use client's preferred format if supported
-            server_caps.object_format = smallvec::smallvec![client_format];
         }
         
-        // Validate negotiated capabilities
-        self.validate_negotiated_capabilities(&server_caps, &negotiated_client_caps)?;
+        // Add server-specific fetch capabilities
+        if self.options.allow_filter {
+            if !fetch_cap_strings.contains(&"filter".to_string()) {
+                fetch_cap_strings.push("filter".to_string());
+            }
+        }
         
-        Ok((server_caps, negotiated_client_caps))
+        caps.push(format!("fetch={}", fetch_cap_strings.join(" ")));
+        
+        // ls-refs command with its features
+        let ls_refs_command = Command::LsRefs;
+        let ls_refs_features = ls_refs_command.default_features(ProtocolVersion::V2, &default_caps);
+        let mut ls_refs_cap_strings = vec!["symrefs".to_string(), "peel".to_string(), "unborn".to_string()];
+        
+        for (feature, _) in &ls_refs_features {
+            if *feature != "ls-refs" && !ls_refs_cap_strings.contains(&feature.to_string()) {
+                ls_refs_cap_strings.push(feature.to_string());
+            }
+        }
+
+        caps.push(format!("ls-refs={}", ls_refs_cap_strings.join(" ")));
+
+        if self.options.enable_object_info {
+            // object-info command with its features
+            let object_info_command = Command::ObjectInfo;
+            let object_info_features = object_info_command.default_features(ProtocolVersion::V2, &default_caps);
+            let mut object_info_cap_strings = vec!["size".to_string()];
+
+            for (feature, _) in &object_info_features {
+                if *feature != "object-info" && !object_info_cap_strings.contains(&feature.to_string()) {
+                    object_info_cap_strings.push(feature.to_string());
+                }
+            }
+
+            caps.push(format!("object-info={}", object_info_cap_strings.join(" ")));
+        }
+        
+        caps.join("\n")
     }
     
-    /// Validate that negotiated capabilities are consistent and safe
-    fn validate_negotiated_capabilities(
-        &self,
-        server_caps: &ServerCapabilities,
-        client_caps: &ClientCapabilities,
-    ) -> Result<()> {
-        // Check that object format is consistent
-        if let Some(client_format) = client_caps.object_format {
-            if !server_caps.object_format.contains(&client_format) {
-                return Err(Error::CapabilityMismatch {
-                    message: "Client and server object formats don't match".to_string(),
-                });
-            }
-        }
+    /// Build V2 capabilities string
+    fn build_v2_capabilities_string(&self) -> String {
+        let mut caps = Vec::new();
         
-        // Check filter compatibility
-        if let Some(ref filter) = client_caps.filter {
-            if !server_caps.filter {
-                return Err(Error::UnsupportedCapability {
-                    capability: format!("filter={}", filter.to_str_lossy()),
-                });
-            }
-            
-            // Validate filter specification
-            self.validate_filter_spec(filter.as_ref())?;
-        }
+        // Agent capability
+        caps.push(format!("agent=git/gitoxide-{}", crate::VERSION));
         
-        // Check shallow capability consistency
-        if client_caps.deepen_relative && !server_caps.deepen_relative {
-            return Err(Error::UnsupportedCapability {
-                capability: "deepen-relative".to_string(),
-            });
-        }
+        // Object format
+        caps.push("object-format=sha1".to_string());
         
-        Ok(())
-    }
-    
-    /// Validate filter specification
-    fn validate_filter_spec(&self, filter: &BStr) -> Result<()> {
-        let filter_str = filter.to_str_lossy();
-        
-        if filter_str == "blob:none" {
-            // Always valid
-            Ok(())
-        } else if filter_str.starts_with("blob:limit=") {
-            // Validate size limit
-            let limit_str = &filter_str["blob:limit=".len()..];
-            limit_str.parse::<u64>()
-                .map_err(|_| Error::InvalidFilter { 
-                    message: format!("Invalid size limit in filter '{}'", filter_str),
-                })?;
-            Ok(())
-        } else if filter_str.starts_with("tree:") {
-            // Validate tree depth
-            let depth_str = &filter_str["tree:".len()..];
-            depth_str.parse::<u32>()
-                .map_err(|_| Error::InvalidFilter {
-                    message: format!("Invalid tree depth in filter '{}'", filter_str),
-                })?;
-            Ok(())
-        } else if filter_str.starts_with("sparse:") {
-            // Validate sparse checkout spec (simplified validation)
-            if filter_str.len() <= "sparse:".len() {
-                return Err(Error::InvalidFilter {
-                    message: format!("Empty sparse specification in filter '{}'", filter_str),
-                });
-            }
-            Ok(())
+        // Fetch command with basic capabilities
+        let mut fetch_caps = vec!["shallow", "filter"];
+        if self.options.allow_filter {
+            // Keep filter capability
         } else {
-            Err(Error::InvalidFilter {
-                message: format!("Unknown filter type in '{}'", filter_str),
-            })
+            fetch_caps.retain(|&x| x != "filter");
         }
+        
+        caps.push(format!("fetch={}", fetch_caps.join(" ")));
+        
+        // ls-refs command
+        caps.push("ls-refs=symrefs peel unborn".to_string());
+
+        // object-info command
+        let object_info_caps = vec!["size", "type"];
+        
+        caps.join("\n")
     }
     
-    /// Get agent string for capability advertisement
-    fn get_agent_string(&self) -> BString {
-        format!("gitoxide/{}", env!("CARGO_PKG_VERSION")).into()
+    /// Get the default server capabilities based on repository and configuration
+    pub fn default_server_capabilities(&self) -> ServerCapabilities {
+        ServerCapabilities::default()
     }
     
-    /// Get supported object formats
-    fn get_supported_object_formats(&self) -> Vec<gix_hash::Kind> {
-        // Return the repository's hash kind (currently only SHA-1 is supported by gitoxide)
-        vec![self.repository.object_hash()]
-    }
-    
-    /// Generate a session ID for request correlation
-    fn generate_session_id(&self) -> Option<BString> {
-        if self.options.enable_session_id {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            
-            // Simple session ID: timestamp + process ID as unique component
-            let session_id = format!("gitoxide-{}-{:x}", 
-                timestamp, 
-                std::process::id()
-            );
-            
-            Some(session_id.into())
-        } else {
-            None
+    /// Parse client capabilities from wire protocol
+    pub fn parse_client_capabilities(&self, caps_str: &str) -> Result<ClientCapabilities> {
+        let mut client_caps = ClientCapabilities::default();
+        
+        for cap in caps_str.split_whitespace() {
+            match cap {
+                "multi_ack" => client_caps.multi_ack = MultiAckMode::Basic,
+                "multi_ack_detailed" => client_caps.multi_ack = MultiAckMode::Detailed,
+                "thin-pack" => client_caps.thin_pack = true,
+                "side-band" => client_caps.side_band = SideBandMode::Basic,
+                "side-band-64k" => client_caps.side_band = SideBandMode::SideBand64k,
+                "ofs-delta" => client_caps.ofs_delta = true,
+                "include-tag" => client_caps.include_tag = true,
+                "no-progress" => client_caps.no_progress = true,
+                "shallow" => client_caps.shallow = true,
+                "deepen-relative" => client_caps.deepen_relative = true,
+                cap if cap.starts_with("agent=") => {
+                    client_caps.agent = Some(cap.strip_prefix("agent=").unwrap().into());
+                }
+                cap if cap.starts_with("filter=") => {
+                    client_caps.filter = Some(cap.strip_prefix("filter=").unwrap().into());
+                }
+                cap if cap.starts_with("session-id=") => {
+                    client_caps.session_id = Some(cap.strip_prefix("session-id=").unwrap().into());
+                }
+                _ => {
+                    // Unknown capability - log and continue
+                    eprintln!("Unknown client capability: {}", cap);
+                }
+            }
         }
+        
+        Ok(client_caps)
+    }
+    
+    /// Convert server capabilities to wire format string for V1 protocol
+    pub fn server_capabilities_to_v1_string(&self, caps: &ServerCapabilities) -> String {
+        let mut cap_strings = Vec::new();
+        
+        // Basic capabilities
+        match caps.multi_ack {
+            MultiAckMode::None => {}
+            MultiAckMode::Basic => cap_strings.push("multi_ack".to_string()),
+            MultiAckMode::Detailed => cap_strings.push("multi_ack_detailed".to_string()),
+        }
+        
+        if caps.thin_pack {
+            cap_strings.push("thin-pack".to_string());
+        }
+        
+        match caps.side_band {
+            SideBandMode::None => {}
+            SideBandMode::Basic => cap_strings.push("side-band".to_string()),
+            SideBandMode::SideBand64k => cap_strings.push("side-band-64k".to_string()),
+        }
+        
+        if caps.ofs_delta {
+            cap_strings.push("ofs-delta".to_string());
+        }
+        
+        if caps.include_tag {
+            cap_strings.push("include-tag".to_string());
+        }
+        
+        if caps.shallow {
+            cap_strings.push("shallow".to_string());
+        }
+        
+        if caps.deepen_since {
+            cap_strings.push("deepen-since".to_string());
+        }
+        
+        if caps.deepen_not {
+            cap_strings.push("deepen-not".to_string());
+        }
+        
+        if caps.deepen_relative {
+            cap_strings.push("deepen-relative".to_string());
+        }
+        
+        if caps.filter {
+            cap_strings.push("filter".to_string());
+        }
+        
+        if caps.allow_tip_sha1_in_want {
+            cap_strings.push("allow-tip-sha1-in-want".to_string());
+        }
+        
+        if caps.allow_reachable_sha1_in_want {
+            cap_strings.push("allow-reachable-sha1-in-want".to_string());
+        }
+        
+        if caps.no_done {
+            cap_strings.push("no-done".to_string());
+        }
+        
+        // Agent
+        cap_strings.push(format!("agent={}", caps.agent.to_str_lossy()));
+        
+        cap_strings.join(" ")
+    }
+    
+    /// Validate V2 command arguments using gix-protocol
+    /// Validate a V2 command with arguments using gix-protocol integration  
+    pub fn validate_v2_command(
+        &self, 
+        command: crate::types::Command, 
+        args: &[bstr::BString], 
+        server_caps: &Capabilities
+    ) -> Result<()> {        
+        // Create features from server capabilities
+        let features = command.default_features(ProtocolVersion::V2, server_caps);
+        
+        // Validate using gix-protocol's validation
+        command.validate_argument_prefixes(ProtocolVersion::V2, server_caps, args, &features)
+            .map_err(|e| Error::ProtocolParsing(format!("Command validation failed: {}", e)))
+    }
+    
+    /// Get initial arguments for a V2 command
+    pub fn get_initial_v2_arguments(&self, command: crate::types::Command, server_caps: &Capabilities) -> Vec<bstr::BString> {
+        let features = command.default_features(ProtocolVersion::V2, server_caps);
+        command.initial_v2_arguments(&features)
     }
     
     /// Check if a capability is supported by the server
-    pub fn supports_capability(&self, capability: &str) -> bool {
-        let caps = self.default_server_capabilities();
-        
-        match capability {
-            "multi_ack" => caps.multi_ack != MultiAckMode::None,
-            "multi_ack_detailed" => caps.multi_ack == MultiAckMode::Detailed,
-            "thin-pack" => caps.thin_pack,
-            "side-band" => caps.side_band != SideBandMode::None,
-            "side-band-64k" => caps.side_band == SideBandMode::SideBand64k,
-            "ofs-delta" => caps.ofs_delta,
-            "shallow" => caps.shallow,
-            "deepen-since" => caps.deepen_since,
-            "deepen-not" => caps.deepen_not,
-            "deepen-relative" => caps.deepen_relative,
-            "no-progress" => true, // Always can support no progress
-            "include-tag" => caps.include_tag,
-            "filter" => caps.filter,
-            "allow-tip-sha1-in-want" => caps.allow_tip_sha1_in_want,
-            "allow-reachable-sha1-in-want" => caps.allow_reachable_sha1_in_want,
-            "allow-any-sha1-in-want" => caps.allow_any_sha1_in_want,
-            "no-done" => caps.no_done,
-            "packfile-uris" => caps.packfile_uris,
-            "wait-for-done" => caps.wait_for_done,
-            "object-info" => caps.object_info,
-            _ => false,
-        }
-    }
-    
-    /// Get capability-specific configuration
-    pub fn get_capability_config(&self, capability: &str) -> Option<HashMap<String, String>> {
-        match capability {
-            "filter" => {
-                let mut config = HashMap::new();
-                
-                // Add supported filter types
-                let mut filter_types = Vec::new();
-                if self.options.allow_blob_filter {
-                    filter_types.push("blob:none");
-                    filter_types.push("blob:limit");
-                }
-                if self.options.allow_tree_filter {
-                    filter_types.push("tree");
-                }
-                if self.options.allow_sparse_filter {
-                    filter_types.push("sparse");
-                }
-                
-                if !filter_types.is_empty() {
-                    config.insert("types".to_string(), filter_types.join(","));
-                }
-                
-                Some(config)
-            }
-            "shallow" => {
-                let mut config = HashMap::new();
-                
-                if let Some(max_depth) = self.options.max_shallow_depth {
-                    config.insert("max-depth".to_string(), max_depth.to_string());
-                }
-                
-                Some(config)
-            }
-            "object-format" => {
-                let mut config = HashMap::new();
-                let formats: Vec<String> = self.get_supported_object_formats()
-                    .iter()
-                    .map(|f| f.to_string())
-                    .collect();
-                
-                config.insert("formats".to_string(), formats.join(","));
-                Some(config)
-            }
-            _ => None,
-        }
-    }
-    
-    /// Format capabilities for protocol advertisement
-    pub fn format_capabilities_v1(&self, capabilities: &ServerCapabilities) -> String {
-        let mut caps = Vec::new();
-        
-        // Multi-ack capability
-        match capabilities.multi_ack {
-            MultiAckMode::None => {}
-            MultiAckMode::Basic => caps.push("multi_ack".to_string()),
-            MultiAckMode::Detailed => caps.push("multi_ack_detailed".to_string()),
-        }
-        
-        // Other capabilities
-        if capabilities.thin_pack {
-            caps.push("thin-pack".to_string());
-        }
-        
-        match capabilities.side_band {
-            SideBandMode::None => {}
-            SideBandMode::Basic => caps.push("side-band".to_string()),
-            SideBandMode::SideBand64k => caps.push("side-band-64k".to_string()),
-        }
-        
-        if capabilities.ofs_delta {
-            caps.push("ofs-delta".to_string());
-        }
-        
-        if capabilities.shallow {
-            caps.push("shallow".to_string());
-        }
-        
-        if capabilities.deepen_since {
-            caps.push("deepen-since".to_string());
-        }
-        
-        if capabilities.deepen_not {
-            caps.push("deepen-not".to_string());
-        }
-        
-        if capabilities.deepen_relative {
-            caps.push("deepen-relative".to_string());
-        }
-        
-        if capabilities.no_progress {
-            caps.push("no-progress".to_string());
-        }
-        
-        if capabilities.include_tag {
-            caps.push("include-tag".to_string());
-        }
-        
-        if capabilities.filter {
-            caps.push("filter".to_string());
-        }
-        
-        if capabilities.allow_tip_sha1_in_want {
-            caps.push("allow-tip-sha1-in-want".to_string());
-        }
-        
-        if capabilities.allow_reachable_sha1_in_want {
-            caps.push("allow-reachable-sha1-in-want".to_string());
-        }
-        
-        if capabilities.allow_any_sha1_in_want {
-            caps.push("allow-any-sha1-in-want".to_string());
-        }
-        
-        if capabilities.no_done {
-            caps.push("no-done".to_string());
-        }
-        
-        // Agent string
-        caps.push(format!("agent={}", capabilities.agent.to_str_lossy()));
-        
-        // Object format
-        for format in &capabilities.object_format {
-            caps.push(format!("object-format={}", format));
-        }
-        
-        // Session ID
-        if let Some(ref session_id) = capabilities.session_id {
-            caps.push(format!("session-id={}", session_id.to_str_lossy()));
-        }
-        
-        caps.join(" ")
-    }
-    
-    /// Format capabilities for protocol V2 advertisement
-    pub fn format_capabilities_v2(&self, capabilities: &ServerCapabilities) -> Vec<String> {
-        let mut caps = Vec::new();
-        
-        // Version
-        caps.push("version 2".to_string());
-        
-        // Agent
-        caps.push(format!("agent={}", capabilities.agent.to_str_lossy()));
-        
-        // Object formats
-        for format in &capabilities.object_format {
-            caps.push(format!("object-format={}", format));
-        }
-        
-        // Commands with their capabilities
-        caps.push("ls-refs=unborn".to_string());
-        
-        // Fetch command capabilities
-        let mut fetch_caps = Vec::new();
-        if capabilities.shallow {
-            fetch_caps.push("shallow");
-        }
-        if capabilities.filter {
-            fetch_caps.push("filter");
-        }
-        match capabilities.side_band {
-            SideBandMode::None => {}
-            SideBandMode::Basic => fetch_caps.push("sideband"),
-            SideBandMode::SideBand64k => fetch_caps.push("sideband-all"),
-        }
-        if capabilities.packfile_uris {
-            fetch_caps.push("packfile-uris");
-        }
-        if capabilities.wait_for_done {
-            fetch_caps.push("wait-for-done");
-        }
-        
-        if fetch_caps.is_empty() {
-            caps.push("fetch".to_string());
-        } else {
-            caps.push(format!("fetch={}", fetch_caps.join(" ")));
-        }
-        
-        // Server info command
-        caps.push("server-info".to_string());
-        
-        // Object info command
-        if capabilities.object_info {
-            caps.push("object-info".to_string());
-        }
-        
-        // Session ID
-        if let Some(ref session_id) = capabilities.session_id {
-            caps.push(format!("session-id={}", session_id.to_str_lossy()));
-        }
-        
-        caps
+    pub fn supports_capability(&self, caps: &Capabilities, capability: &str) -> bool {
+        caps.contains(capability)
     }
 }

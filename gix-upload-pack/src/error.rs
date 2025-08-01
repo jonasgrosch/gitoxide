@@ -28,6 +28,10 @@ pub enum Error {
     #[error("Protocol error: {0}")]
     Protocol(#[from] gix_protocol::handshake::Error),
 
+    /// Protocol parsing error
+    #[error("Protocol parsing error: {0}")]
+    ProtocolParsing(String),
+
     /// Transport error
     #[error("Transport error: {0}")]
     Transport(#[from] gix_transport::client::Error),

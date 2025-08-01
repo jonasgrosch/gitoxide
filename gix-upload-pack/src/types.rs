@@ -5,88 +5,67 @@ use gix_hash::ObjectId;
 use smallvec::SmallVec;
 use std::collections::HashSet;
 
-/// Protocol version supported by the server
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ProtocolVersion {
-    /// Version 0 (legacy, no explicit version)
-    V0 = 0,
-    /// Version 1 (stateful)
-    V1 = 1,
-    /// Version 2 (stateless, preferred)
-    V2 = 2,
+// Re-export transport types
+pub use gix_transport::client::Capabilities;
+pub use gix_transport::Protocol as ProtocolVersion;
+
+// Re-export protocol types for gradual migration
+pub use gix_protocol::handshake::Ref as ProtocolRef;
+pub use gix_protocol::Command;
+pub use gix_protocol::fetch::response::Acknowledgement;
+pub use gix_packetline::Channel as SideBandChannel;
+pub use gix_shallow::Update as ShallowUpdate;
+
+// Use ProtocolRef directly as our Reference type
+pub type Reference = ProtocolRef;
+
+/// Helper trait for working with protocol references
+pub trait ProtocolRefExt {
+    /// Get the reference name
+    fn ref_name(&self) -> &BString;
+    /// Get the target object ID
+    fn target_oid(&self) -> ObjectId;
+    /// Get the peeled object ID if this is a peeled ref
+    fn peeled_oid(&self) -> Option<ObjectId>;
+    /// Check if this is a symbolic reference
+    fn is_symbolic_ref(&self) -> bool;
+    /// Check if this is an unborn reference
+    fn is_unborn_ref(&self) -> bool;
 }
 
-impl Default for ProtocolVersion {
-    fn default() -> Self {
-        Self::V2
-    }
-}
-
-impl From<ProtocolVersion> for gix_transport::Protocol {
-    fn from(version: ProtocolVersion) -> Self {
-        match version {
-            ProtocolVersion::V0 => Self::V0,
-            ProtocolVersion::V1 => Self::V1,
-            ProtocolVersion::V2 => Self::V2,
+impl ProtocolRefExt for ProtocolRef {
+    fn ref_name(&self) -> &BString {
+        match self {
+            ProtocolRef::Peeled { full_ref_name, .. } => full_ref_name,
+            ProtocolRef::Direct { full_ref_name, .. } => full_ref_name,
+            ProtocolRef::Symbolic { full_ref_name, .. } => full_ref_name,
+            ProtocolRef::Unborn { full_ref_name, .. } => full_ref_name,
         }
     }
-}
-
-impl TryFrom<u8> for ProtocolVersion {
-    type Error = crate::Error;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::V0),
-            1 => Ok(Self::V1),
-            2 => Ok(Self::V2),
-            version => Err(crate::Error::InvalidProtocolVersion { version }),
+    
+    fn target_oid(&self) -> ObjectId {
+        match self {
+            ProtocolRef::Peeled { object, .. } => *object,
+            ProtocolRef::Direct { object, .. } => *object,
+            ProtocolRef::Symbolic { object, .. } => *object,
+            ProtocolRef::Unborn { .. } => ObjectId::null(gix_hash::Kind::Sha1),
         }
     }
-}
-
-/// Represents a Git reference with its target
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reference {
-    /// The full reference name (e.g., "refs/heads/main")
-    pub name: BString,
-    /// The object ID this reference points to
-    pub target: ObjectId,
-    /// Whether this is a peeled reference (annotated tag -> commit)
-    pub peeled: Option<ObjectId>,
-}
-
-/// Client capabilities and requested features
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ClientCapabilities {
-    /// Multi-ack capability level
-    pub multi_ack: MultiAckMode,
-    /// Support for thin-pack
-    pub thin_pack: bool,
-    /// Support for side-band
-    pub side_band: SideBandMode,
-    /// Support for offset deltas
-    pub ofs_delta: bool,
-    /// Include tags in pack
-    pub include_tag: bool,
-    /// Suppress progress information
-    pub no_progress: bool,
-    /// Allow tip SHA1 in want
-    pub allow_tip_sha1_in_want: bool,
-    /// Allow reachable SHA1 in want
-    pub allow_reachable_sha1_in_want: bool,
-    /// Deepen capability
-    pub deepen_relative: bool,
-    /// Shallow capability
-    pub shallow: bool,
-    /// Filter capability with spec
-    pub filter: Option<BString>,
-    /// Session ID for tracing
-    pub session_id: Option<BString>,
-    /// Agent string
-    pub agent: Option<BString>,
-    /// Object format (hash algorithm)
-    pub object_format: Option<gix_hash::Kind>,
+    
+    fn peeled_oid(&self) -> Option<ObjectId> {
+        match self {
+            ProtocolRef::Peeled { object, .. } => Some(*object),
+            _ => None,
+        }
+    }
+    
+    fn is_symbolic_ref(&self) -> bool {
+        matches!(self, ProtocolRef::Symbolic { .. })
+    }
+    
+    fn is_unborn_ref(&self) -> bool {
+        matches!(self, ProtocolRef::Unborn { .. })
+    }
 }
 
 /// Multi-ack modes for negotiation
@@ -123,7 +102,7 @@ impl Default for SideBandMode {
     }
 }
 
-/// Server capabilities that can be advertised to clients
+/// Server configuration for capability management
 #[derive(Debug, Clone)]
 pub struct ServerCapabilities {
     /// Multi-ack support level
@@ -166,7 +145,7 @@ pub struct ServerCapabilities {
     pub packfile_uris: bool,
     /// Wait for done support (protocol v2)
     pub wait_for_done: bool,
-    /// Object info support (protocol v2)
+    /// Object info support (protocol v2) - disabled by default
     pub object_info: bool,
 }
 
@@ -193,9 +172,42 @@ impl Default for ServerCapabilities {
             session_id: None,
             packfile_uris: false,
             wait_for_done: true,
-            object_info: false,
+            object_info: false, // Disabled by default
         }
     }
+}
+
+/// Client capabilities parsed from the wire protocol
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientCapabilities {
+    /// Multi-ack capability level
+    pub multi_ack: MultiAckMode,
+    /// Support for thin-pack
+    pub thin_pack: bool,
+    /// Support for side-band
+    pub side_band: SideBandMode,
+    /// Support for offset deltas
+    pub ofs_delta: bool,
+    /// Include tags in pack
+    pub include_tag: bool,
+    /// Suppress progress information
+    pub no_progress: bool,
+    /// Allow tip SHA1 in want
+    pub allow_tip_sha1_in_want: bool,
+    /// Allow reachable SHA1 in want
+    pub allow_reachable_sha1_in_want: bool,
+    /// Deepen capability
+    pub deepen_relative: bool,
+    /// Shallow capability
+    pub shallow: bool,
+    /// Filter capability with spec
+    pub filter: Option<BString>,
+    /// Session ID for tracing
+    pub session_id: Option<BString>,
+    /// Agent string
+    pub agent: Option<BString>,
+    /// Object format (hash algorithm)
+    pub object_format: Option<gix_hash::Kind>,
 }
 
 /// Request from client during negotiation
@@ -247,17 +259,8 @@ pub enum ClientRequest {
 /// Server response during negotiation
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerResponse {
-    /// Acknowledge client has object
-    Ack {
-        /// Object ID being acknowledged
-        oid: ObjectId,
-        /// Status of the acknowledgment
-        status: AckStatus,
-    },
-    /// Negative acknowledgment
-    Nak,
-    /// Server is ready to send pack
-    Ready,
+    /// Acknowledgment response (includes Common, Ready, Nak variants)
+    Ack(Acknowledgement),
     /// Shallow commit information
     Shallow {
         /// Shallow commit OID
@@ -275,15 +278,27 @@ pub enum ServerResponse {
     },
 }
 
-/// Status of acknowledgment during negotiation
+/// Status of acknowledgment during negotiation (server-side perspective)
+/// This provides more granular control than the client-side Acknowledgement enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckStatus {
     /// Simple acknowledgment
     Common,
-    /// Ready to receive more
+    /// Ready to receive more (multi-ack mode)
     Continue,
     /// Ready to send pack
     Ready,
+}
+
+impl AckStatus {
+    /// Convert to client-side Acknowledgement when possible
+    pub fn to_acknowledgement(self, oid: ObjectId) -> Option<Acknowledgement> {
+        match self {
+            AckStatus::Common => Some(Acknowledgement::Common(oid)),
+            AckStatus::Ready => Some(Acknowledgement::Ready),
+            AckStatus::Continue => None, // Continue doesn't map to client-side enum
+        }
+    }
 }
 
 /// Negotiation state tracking

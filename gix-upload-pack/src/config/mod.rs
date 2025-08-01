@@ -284,6 +284,11 @@ impl ServerOptions {
                 options.hidden_refs.push(BString::from(value.into_owned()));
             }
         }
+
+        // Check if object info command is enabled via transfer.advertiseobjectinfo
+        if let Some(value) = config.boolean("transfer.advertiseObjectInfo") {
+            options.enable_object_info = value;
+        }
         
         Ok(options)
     }

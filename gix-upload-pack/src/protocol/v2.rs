@@ -7,7 +7,7 @@ use crate::{
     config::ServerOptions,
     error::{Error, Result},
     protocol::ProtocolHandler,
-    server::pack_generation,
+    server::{capabilities::CapabilityManager, pack_generation},
     types::*,
 };
 use bstr::ByteSlice;
@@ -19,104 +19,58 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
 };
 
+#[cfg(feature = "async")]
+use futures_lite::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "async")]
+use futures_lite::AsyncBufReadExt;
+
 /// Protocol V2 handler
 pub struct Handler<'a> {
     repository: &'a Repository,
     options: &'a ServerOptions,
-}
-
-/// Protocol V2 commands
-#[derive(Debug, Clone, PartialEq)]
-pub enum Command {
-    LsRefs,
-    Fetch,
-    ServerInfo,
-    ObjectInfo,
-}
-
-impl std::str::FromStr for Command {
-    type Err = Error;
-    
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "ls-refs" => Ok(Command::LsRefs),
-            "fetch" => Ok(Command::Fetch),
-            "server-info" => Ok(Command::ServerInfo),
-            "object-info" => Ok(Command::ObjectInfo),
-            _ => Err(Error::UnsupportedCommand { command: s.to_string() }),
-        }
-    }
+    capability_manager: CapabilityManager<'a>,
 }
 
 impl<'a> Handler<'a> {
     /// Create a new V2 protocol handler
     pub fn new(repository: &'a Repository, options: &'a ServerOptions) -> Self {
-        Self { repository, options }
+        Self { 
+            repository, 
+            options,
+            capability_manager: CapabilityManager::new(repository, options),
+        }
     }
     
-    /// Send capability advertisement
+    /// Send capability advertisement using gix-protocol integration
+    #[cfg(feature = "async")]
+    async fn advertise_capabilities<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        // Build capabilities using the integrated capability manager
+        let server_caps = self.capability_manager.build_server_capabilities(ProtocolVersion::V2)?;
+        
+        // Send capabilities directly - they're already in the right format from gix-protocol
+        // Write each capability line
+        for capability in server_caps.iter() {
+            let cap_line = format!("{}\n", capability.name().to_str_lossy());
+            gix_packetline::encode::data_to_write(cap_line.as_bytes(), &mut *writer).await?;
+        }
+        
+        // End capabilities with flush
+        gix_packetline::PacketLineRef::Flush.write_to(&mut *writer).await?;
+        
+        Ok(())
+    }
+
+    /// Send capability advertisement using gix-protocol integration (sync version)
+    #[cfg(not(feature = "async"))]
     fn advertise_capabilities<W: Write>(&self, writer: &mut W) -> Result<()> {
-        let capabilities = &self.options.capabilities;
+        // Build capabilities using the integrated capability manager
+        let server_caps = self.capability_manager.build_server_capabilities(ProtocolVersion::V2)?;
         
-        // Version announcement
-        gix_packetline::encode::data_to_write(b"version 2\n", &mut *writer)?;
-        
-        // Agent capability
-        let agent_line = format!("agent={}\n", capabilities.agent.to_str_lossy());
-        gix_packetline::encode::data_to_write(agent_line.as_bytes(), &mut *writer)?;
-        
-        // Supported object formats
-        if !capabilities.object_format.is_empty() {
-            gix_packetline::encode::data_to_write(b"object-format=sha1\n", &mut *writer)?;
-        }
-        
-        // Commands
-        gix_packetline::encode::data_to_write(b"ls-refs=unborn\n", &mut *writer)?;
-        
-        // Fetch command with capabilities
-        let mut fetch_caps = Vec::new();
-        
-        if capabilities.shallow {
-            fetch_caps.push("shallow");
-        }
-        
-        if capabilities.filter {
-            fetch_caps.push("filter");
-        }
-        
-        match capabilities.side_band {
-            SideBandMode::None => {}
-            SideBandMode::Basic => fetch_caps.push("sideband"),
-            SideBandMode::SideBand64k => fetch_caps.push("sideband-all"),
-        }
-        
-        if capabilities.packfile_uris {
-            fetch_caps.push("packfile-uris");
-        }
-        
-        if capabilities.wait_for_done {
-            fetch_caps.push("wait-for-done");
-        }
-        
-        let fetch_line = if fetch_caps.is_empty() {
-            "fetch\n".to_string()
-        } else {
-            format!("fetch={}\n", fetch_caps.join(" "))
-        };
-        gix_packetline::encode::data_to_write(fetch_line.as_bytes(), &mut *writer)?;
-        
-        // Server-option capability
-        gix_packetline::encode::data_to_write(b"server-option\n", &mut *writer)?;
-        
-        // Object-info command if supported
-        if capabilities.object_info {
-            gix_packetline::encode::data_to_write(b"object-info\n", &mut *writer)?;
-        }
-        
-        // Session ID if available
-        if let Some(session_id) = &capabilities.session_id {
-            let session_line = format!("session-id={}\n", session_id.to_str_lossy());
-            gix_packetline::encode::data_to_write(session_line.as_bytes(), &mut *writer)?;
+        // Send capabilities directly - they're already in the right format from gix-protocol
+        // Write each capability line
+        for capability in server_caps.iter() {
+            let cap_line = format!("{}\n", capability.name().to_str_lossy());
+            gix_packetline::encode::data_to_write(cap_line.as_bytes(), &mut *writer)?;
         }
         
         // End capabilities with flush
@@ -125,13 +79,24 @@ impl<'a> Handler<'a> {
         Ok(())
     }
     
-    /// Handle ls-refs command
-    fn handle_ls_refs<R: BufRead, W: Write>(
+    /// Handle ls-refs command with validation
+    #[cfg(feature = "async")]
+    async fn handle_ls_refs<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         &self,
-        reader: &mut StreamingPeekableIter<R>,
+        _reader: &mut StreamingPeekableIter<R>,
         writer: &mut W,
         args: &HashMap<String, String>,
     ) -> Result<()> {
+        // Get server capabilities for validation
+        let server_caps = self.capability_manager.build_server_capabilities(ProtocolVersion::V2)?;
+        
+        // Validate ls-refs command arguments
+        let args_vec: Vec<bstr::BString> = args.iter()
+            .map(|(k, v)| if v.is_empty() { k.as_bytes().into() } else { format!("{}={}", k, v).into() })
+            .collect();
+        
+        self.capability_manager.validate_v2_command(Command::LsRefs, &args_vec, &server_caps)?;
+        
         // Parse arguments
         let symrefs = args.get("symrefs").is_some();
         let peel = args.get("peel").is_some();
@@ -146,10 +111,10 @@ impl<'a> Handler<'a> {
         
         // Send references
         for reference in refs {
-            let mut line = format!("{} {}", reference.target.to_hex(), reference.name.to_str_lossy());
+            let mut line = format!("{} {}", reference.target_oid().to_hex(), reference.ref_name().to_str_lossy());
             
             // Add symref-target for HEAD if requested
-            if symrefs && reference.name == "HEAD" {
+            if symrefs && reference.ref_name() == "HEAD" {
                 if let Ok(head) = self.repository.head() {
                     if let gix::head::Kind::Symbolic(target_ref) = head.kind {
                         line.push_str(&format!(" symref-target:{}", target_ref.name.as_bstr().to_str_lossy()));
@@ -159,27 +124,27 @@ impl<'a> Handler<'a> {
             
             // Add peeled info if requested and available
             if peel {
-                if let Some(peeled) = &reference.peeled {
+                if let Some(peeled) = reference.peeled_oid() {
                     line.push_str(&format!(" peeled:{}", peeled.to_hex()));
                 }
             }
             
             line.push('\n');
-            gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer)?;
+            gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer).await?;
         }
         
         // Handle symbolic refs if requested
         if symrefs {
-            self.send_symrefs(&mut *writer)?;
+            self.send_symrefs(&mut *writer).await?;
         }
         
         // Handle unborn HEAD if requested
         if unborn {
-            self.send_unborn_head(&mut *writer)?;
+            self.send_unborn_head(&mut *writer).await?;
         }
         
         // End with flush
-        gix_packetline::PacketLineRef::Flush.write_to(writer)?;
+        gix_packetline::PacketLineRef::Flush.write_to(writer).await?;
         
         Ok(())
     }
@@ -194,19 +159,17 @@ impl<'a> Handler<'a> {
                 gix::head::Kind::Symbolic(target_ref) => {
                     // Add HEAD as a reference pointing to the same commit as the target
                     if let gix::refs::Target::Object(oid) = &target_ref.target {
-                        refs.push(Reference {
-                            name: "HEAD".into(),
-                            target: *oid,
-                            peeled: None,
+                        refs.push(ProtocolRef::Direct {
+                            full_ref_name: "HEAD".into(),
+                            object: *oid,
                         });
                     }
                 }
                 gix::head::Kind::Detached { target, .. } => {
                     // Detached HEAD
-                    refs.push(Reference {
-                        name: "HEAD".into(),
-                        target,
-                        peeled: None,
+                    refs.push(ProtocolRef::Direct {
+                        full_ref_name: "HEAD".into(),
+                        object: target,
                     });
                 }
                 gix::head::Kind::Unborn(_) => {
@@ -272,17 +235,24 @@ impl<'a> Handler<'a> {
                             None
                         };
                         
-                        refs.push(Reference {
-                            name,
-                            target,
-                            peeled,
-                        });
+                        if let Some(peeled) = peeled {
+                            refs.push(ProtocolRef::Peeled {
+                                full_ref_name: name,
+                                tag: target,
+                                object: peeled,
+                            });
+                        } else {
+                            refs.push(ProtocolRef::Direct {
+                                full_ref_name: name,
+                                object: target,
+                            });
+                        }
                     }
                 }
             }
             
             // Sort refs for consistent output
-            refs.sort_by(|a, b| a.name.cmp(&b.name));
+            refs.sort_by(|a, b| a.ref_name().cmp(b.ref_name()));
             
             return Ok(refs);
         };
@@ -323,22 +293,51 @@ impl<'a> Handler<'a> {
                         None
                     };
                     
-                    refs.push(Reference {
-                        name,
-                        target,
-                        peeled,
-                    });
+                    if let Some(peeled) = peeled {
+                        refs.push(ProtocolRef::Peeled {
+                            full_ref_name: name,
+                            tag: target,
+                            object: peeled,
+                        });
+                    } else {
+                        refs.push(ProtocolRef::Direct {
+                            full_ref_name: name,
+                            object: target,
+                        });
+                    }
                 }
             }
         }
-        
-        // Sort refs for consistent output
-        refs.sort_by(|a, b| a.name.cmp(&b.name));
         
         Ok(refs)
     }
     
     /// Send symbolic references
+    #[cfg(feature = "async")]
+    async fn send_symrefs<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        // Find symbolic references - use all() method instead of iter()
+        for reference in self.repository.references().map_err(|e| Error::RefPackedBuffer(e))?.all().map_err(|e| Error::RefIterInit(e))? {
+            let reference = reference.map_err(|e| Error::Boxed(e))?;
+            
+            if let gix::refs::TargetRef::Symbolic(target) = reference.target() {
+                let name = reference.name().as_bstr();
+                let target_name = target.as_bstr();
+                
+                // Don't send hidden refs
+                if self.options.is_ref_hidden(name.to_str_lossy().as_ref()) {
+                    continue;
+                }
+                
+                let symref_line = format!("symref-target:{} {}\n", name.to_str_lossy(), target_name.to_str_lossy());
+                gix_packetline::encode::data_to_write(symref_line.as_bytes(), &mut *writer).await?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Send symbolic references (sync version)
+    #[cfg(not(feature = "async"))]
     fn send_symrefs<W: Write>(&self, writer: &mut W) -> Result<()> {
         // Find symbolic references - use all() method instead of iter()
         for reference in self.repository.references().map_err(|e| Error::RefPackedBuffer(e))?.all().map_err(|e| Error::RefIterInit(e))? {
@@ -362,6 +361,24 @@ impl<'a> Handler<'a> {
     }
     
     /// Send unborn HEAD information
+    #[cfg(feature = "async")]
+    async fn send_unborn_head<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        // Check if HEAD is unborn (points to non-existent ref)
+        if let Ok(head_ref) = self.repository.refs.find("HEAD") {
+            if let gix::refs::Target::Symbolic(target) = head_ref.target {
+                // Check if target exists
+                if self.repository.refs.find(target.as_bstr()).is_err() {
+                    let unborn_line = format!("unborn {}\n", target.as_bstr().to_str_lossy());
+                    gix_packetline::encode::data_to_write(unborn_line.as_bytes(), writer).await?;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Send unborn HEAD information (sync version)
+    #[cfg(not(feature = "async"))]
     fn send_unborn_head<W: Write>(&self, writer: &mut W) -> Result<()> {
         // Check if HEAD is unborn (points to non-existent ref)
         if let Ok(head_ref) = self.repository.refs.find("HEAD") {
@@ -377,8 +394,9 @@ impl<'a> Handler<'a> {
         Ok(())
     }
     
-    /// Handle fetch command
-    fn handle_fetch<R: BufRead, W: Write>(
+    /// Handle fetch command with validation
+    #[cfg(feature = "async")]
+    async fn handle_fetch<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         &self,
         reader: &mut StreamingPeekableIter<R>,
         writer: &mut W,
@@ -387,12 +405,24 @@ impl<'a> Handler<'a> {
     ) -> Result<()> {
         eprintln!("Debug: handle_fetch called with args: {:?}", args);
         
+        // Get server capabilities for validation
+        let server_caps = self.capability_manager.build_server_capabilities(ProtocolVersion::V2)?;
+        
+        // Get initial arguments and validate
+        let initial_args = self.capability_manager.get_initial_v2_arguments(Command::Fetch, &server_caps);
+        let args_vec: Vec<bstr::BString> = args.iter()
+            .map(|(k, v)| if v.is_empty() { k.as_bytes().into() } else { format!("{}={}", k, v).into() })
+            .chain(initial_args.into_iter())
+            .collect();
+        
+        self.capability_manager.validate_v2_command(Command::Fetch, &args_vec, &server_caps)?;
+        
         // Parse fetch arguments
         let thin_pack = args.get("thin-pack").is_some();
         let ofs_delta = args.get("ofs-delta").is_some();
         let include_tag = args.get("include-tag").is_some();
         let sideband_all = args.get("sideband-all").is_some();
-        let wait_for_done = args.get("wait-for-done").is_some();
+        let _wait_for_done = args.get("wait-for-done").is_some();
         
         // Parse filter if present
         let filter = args.get("filter").map(|f| f.as_str().into());
@@ -408,7 +438,7 @@ impl<'a> Handler<'a> {
         }
         
         // Read fetch parameters
-        self.read_fetch_parameters(reader, session)?;
+        self.read_fetch_parameters(reader, session).await?;
         
         eprintln!("Debug: After reading parameters, wants: {:?}, haves: {:?}", 
                   session.negotiation.wants.len(), 
@@ -420,42 +450,119 @@ impl<'a> Handler<'a> {
             // and don't need negotiation (simplified for this example)
             
             // Send acknowledgments section
-            gix_packetline::encode::data_to_write(b"acknowledgments\n", &mut *writer)?;
+            gix_packetline::encode::data_to_write(b"acknowledgments\n", &mut *writer).await?;
             
             // Find common commits (simplified)
             for have in &session.negotiation.haves {
                 if self.repository.objects.contains(have) {
                     session.negotiation.common.insert(*have);
                     let ack_line = format!("ACK {}\n", have.to_hex());
-                    gix_packetline::encode::data_to_write(ack_line.as_bytes(), &mut *writer)?;
+                    gix_packetline::encode::data_to_write(ack_line.as_bytes(), &mut *writer).await?;
                 }
             }
             
             // End acknowledgments
-            gix_packetline::PacketLineRef::Flush.write_to(&mut *writer)?;
+            gix_packetline::PacketLineRef::Flush.write_to(&mut *writer).await?;
             
             // Send packfile section
-            gix_packetline::encode::data_to_write(b"packfile\n", &mut *writer)?;
+            gix_packetline::encode::data_to_write(b"packfile\n", &mut *writer).await?;
             
             eprintln!("Debug: About to generate pack for {} wants", session.negotiation.wants.len());
             
             // Generate and send pack
             let pack_generator = pack_generation::PackGenerator::new(self.repository, self.options);
-            let pack_stats = pack_generator.generate_pack(&mut *writer, session)?;
+            let pack_stats = pack_generator.generate_pack(&mut *writer, session).await?;
             
             eprintln!("Debug: Pack generation complete - stats: {:?}", pack_stats);
         }
         
         Ok(())
     }
+
+    #[cfg(feature = "async")]
+    async fn handle_object_info<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        &self,
+        reader: &mut StreamingPeekableIter<R>,
+        writer: &mut W,
+        args: &HashMap<String, String>,
+        _session: &mut SessionContext,
+    ) -> Result<()> {
+        // Get server capabilities for validation
+        let server_caps = self.capability_manager.build_server_capabilities(ProtocolVersion::V2)?;
+        
+        // Validate object-info command arguments
+        let args_vec: Vec<bstr::BString> = args.iter()
+            .map(|(k, v)| if v.is_empty() { k.as_bytes().into() } else { format!("{}={}", k, v).into() })
+            .collect();
+        
+        self.capability_manager.validate_v2_command(Command::ObjectInfo, &args_vec, &server_caps)?;
+
+        // Check if size information is requested (currently the only supported attribute)
+        let request_size = args.get("size").is_some();
+        
+        if !request_size {
+            return Err(Error::custom("object-info requires 'size' argument"));
+        }
+        
+        // Send the attributes line first (per spec: attrs = "size")
+        gix_packetline::encode::data_to_write(b"size\n", &mut *writer).await?;
+        
+        // Read object OIDs from the request
+        let mut oids = Vec::new();
+        while let Some(line_result) = reader.read_line().await {
+            let line = line_result??;
+            if matches!(line, gix_packetline::PacketLineRef::Flush) {
+                break;
+            }
+            
+            if let Some(line_data) = line.as_slice() {
+                if let Some(oid_line) = line_data.strip_prefix(b"oid ") {
+                    let oid_str = std::str::from_utf8(oid_line.trim_ascii())
+                        .map_err(|_| Error::custom("Invalid UTF-8 in oid line"))?;
+                    
+                    let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
+                        .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
+                    
+                    oids.push(oid);
+                } else {
+                    // Skip unknown lines
+                    eprintln!("Debug: Skipping unknown object-info line: {:?}", 
+                             std::str::from_utf8(line_data).unwrap_or("<invalid utf8>"));
+                }
+            }
+        }
+        
+        // Process each requested object and send obj-info lines
+        for oid in oids {
+            match self.repository.find_object(oid) {
+                Ok(obj) => {
+                    // Send obj-info: obj-id SP obj-size
+                    let info_line = format!("{} {}\n", oid.to_hex(), obj.data.len());
+                    gix_packetline::encode::data_to_write(info_line.as_bytes(), &mut *writer).await?;
+                }
+                Err(_) => {
+                    // Object not found - per spec, we might skip missing objects
+                    // or we could send an error. The spec isn't entirely clear,
+                    // but Git's implementation typically skips missing objects silently
+                    eprintln!("Debug: Object not found: {}", oid.to_hex());
+                }
+            }
+        }
+        
+        // End response with flush packet
+        gix_packetline::PacketLineRef::Flush.write_to(writer).await?;
+        
+        Ok(())
+    }
     
     /// Read fetch parameters from client
-    fn read_fetch_parameters<R: BufRead>(
+    #[cfg(feature = "async")]
+    async fn read_fetch_parameters<R: AsyncRead + Unpin>(
         &self,
         reader: &mut StreamingPeekableIter<R>,
         session: &mut SessionContext,
     ) -> Result<()> {
-        while let Some(line_result) = reader.read_line() {
+        while let Some(line_result) = reader.read_line().await {
             let line = line_result??;
             if matches!(line, gix_packetline::PacketLineRef::Flush) {
                 break;
@@ -557,81 +664,16 @@ impl<'a> Handler<'a> {
         }
         Ok(())
     }
-    
-    /// Handle object-info command
-    fn handle_object_info<R: BufRead, W: Write>(
-        &self,
-        reader: &mut StreamingPeekableIter<R>,
-        writer: &mut W,
-        args: &HashMap<String, String>,
-    ) -> Result<()> {
-        // Parse requested attributes
-        let mut attributes = Vec::new();
-        if let Some(attrs) = args.get("attributes") {
-            for attr in attrs.split(' ') {
-                attributes.push(attr.to_string());
-            }
-        }
-        
-        // Read object OIDs
-        let mut oids = Vec::new();
-        while let Some(line_result) = reader.read_line() {
-            let line = line_result??;
-            if matches!(line, gix_packetline::PacketLineRef::Flush) {
-                break;
-            }
-            
-            if let Some(line_data) = line.as_slice() {
-                if let Some(oid_line) = line_data.strip_prefix(b"oid ") {
-                let oid_str = std::str::from_utf8(oid_line.trim_ascii())
-                    .map_err(|_| Error::custom("Invalid UTF-8 in oid line"))?;
-                
-                let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
-                    .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
-                
-                    oids.push(oid);
-                }
-            }
-        }
-        
-        // Send object information
-        for oid in oids {
-            if let Ok(obj) = self.repository.find_object(oid) {
-                let mut info_line = format!("{}", oid.to_hex());
-                
-                for attr in &attributes {
-                    match attr.as_str() {
-                        "size" => {
-                            info_line.push_str(&format!(" size {}", obj.data.len()));
-                        }
-                        "type" => {
-                            info_line.push_str(&format!(" type {}", obj.kind));
-                        }
-                        _ => {
-                            // Unknown attribute, skip
-                        }
-                    }
-                }
-                
-                info_line.push('\n');
-                gix_packetline::encode::data_to_write(info_line.as_bytes(), &mut *writer)?;
-            }
-        }
-        
-        // End with flush
-        gix_packetline::PacketLineRef::Flush.write_to(writer)?;
-        
-        Ok(())
-    }
-    
+
     /// Parse command arguments from argument lines
-    fn parse_command_arguments<R: BufRead>(
+    #[cfg(feature = "async")]
+    async fn parse_command_arguments<R: AsyncRead + Unpin>(
         &self,
         reader: &mut StreamingPeekableIter<R>,
     ) -> Result<HashMap<String, String>> {
         let mut args = HashMap::new();
         
-        while let Some(line_result) = reader.read_line() {
+        while let Some(line_result) = reader.read_line().await {
             let line = line_result??;
             if matches!(line, gix_packetline::PacketLineRef::Flush) {
                 break;
@@ -657,13 +699,14 @@ impl<'a> Handler<'a> {
     }
     
     /// Parse command arguments for V2, stopping at fetch parameters
-    fn parse_command_arguments_v2<R: BufRead>(
+    #[cfg(feature = "async")]
+    async fn parse_command_arguments_v2<R: AsyncRead + Unpin>(
         &self,
         reader: &mut StreamingPeekableIter<R>,
     ) -> Result<HashMap<String, String>> {
         let mut args = HashMap::new();
         
-        while let Some(line_result) = reader.read_line() {
+        while let Some(line_result) = reader.read_line().await {
             let line = line_result??;
             if matches!(line, gix_packetline::PacketLineRef::Flush) {
                 break;
@@ -702,13 +745,14 @@ impl<'a> Handler<'a> {
 }
 
 impl<'a> ProtocolHandler for Handler<'a> {
-    fn handle_session<R: Read, W: Write>(
+    #[cfg(feature = "async")]
+    async fn handle_session<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         &mut self,
         input: R,
         mut output: W,
         session: &mut SessionContext,
     ) -> Result<()> {
-        let mut buffered_input = BufReader::new(input);
+        let mut buffered_input = futures_lite::io::BufReader::new(input);
         let mut line_reader = gix_packetline::StreamingPeekableIter::new(
             &mut buffered_input,
             &[PacketLineRef::Flush],
@@ -718,12 +762,12 @@ impl<'a> ProtocolHandler for Handler<'a> {
         // Protocol V2 only advertises capabilities in non-stateless RPC mode
         // In stateless RPC mode (--stateless-rpc), we wait for client command first
         if !session.stateless_rpc {
-            self.advertise_capabilities(&mut output)?;
+            self.advertise_capabilities(&mut output).await?;
         }
         
         // Wait for command
         let mut command = None;
-        while let Some(line_result) = line_reader.read_line() {
+        while let Some(line_result) = line_reader.read_line().await {
             let line = line_result??;
             if matches!(line, gix_packetline::PacketLineRef::Flush) {
                 break;
@@ -733,34 +777,31 @@ impl<'a> ProtocolHandler for Handler<'a> {
                 if let Some(cmd_line) = line_data.strip_prefix(b"command=") {
                 let cmd_str = std::str::from_utf8(cmd_line.trim_ascii())
                     .map_err(|_| Error::custom("Invalid UTF-8 in command line"))?;
-                
-                    command = Some(cmd_str.parse::<Command>()?);
+
+                    command = Command::from_str(cmd_str);
                     break;
                 }
             }
         }
         
-        let command = command.ok_or_else(|| Error::custom("No command specified"))?;
-        
         // Parse command arguments - but STOP at first flush or want/have line
-        let args = self.parse_command_arguments_v2(&mut line_reader)?;
+        let args = self.parse_command_arguments_v2(&mut line_reader).await?;
         
         eprintln!("Debug: Parsed command arguments: {:?}", args);
         
         // Handle the command
         match command {
-            Command::LsRefs => {
-                self.handle_ls_refs(&mut line_reader, &mut output, &args)?;
+            Some(Command::LsRefs) => {
+                self.handle_ls_refs(&mut line_reader, &mut output, &args).await?;
             }
-            Command::Fetch => {
-                self.handle_fetch(&mut line_reader, &mut output, &args, session)?;
+            Some(Command::Fetch) => {
+                self.handle_fetch(&mut line_reader, &mut output, &args, session).await?;
             }
-            Command::ObjectInfo => {
-                self.handle_object_info(&mut line_reader, &mut output, &args)?;
+            Some(Command::ObjectInfo) => {
+                self.handle_object_info(&mut line_reader, &mut output, &args, session).await?;
             }
-            Command::ServerInfo => {
-                // server-info is not a standard V2 command, return error
-                return Err(Error::UnsupportedCommand { command: "server-info".to_string() });
+            None => {
+                return Err(Error::custom(format!("Unsupported command: {:?}", command)));
             }
         }
         
