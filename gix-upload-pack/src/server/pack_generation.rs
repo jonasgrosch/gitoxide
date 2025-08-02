@@ -213,18 +213,12 @@ impl<'a> PackGenerator<'a> {
                     // Only update progress occasionally to avoid performance overhead
                     update_counter += 1;
                     if update_counter % UPDATE_INTERVAL == 0 {
-                        eprintln!("DEBUG: enumerate() - calling progress_reporter.update({}) [batched every {} objects]", objects.len(), UPDATE_INTERVAL);
                         progress_reporter.update(objects.len())?;
                     }
                 }
             }
         }
-        
-        // Final update to ensure we report the final count
-        eprintln!("DEBUG: enumerate() - final progress_reporter.update({})", objects.len());
-        progress_reporter.update(objects.len())?;
 
-        eprintln!("DEBUG: enumerate() - calling progress_reporter.finish()");
         progress_reporter.finish()?;
 
         // Apply filters if needed
@@ -235,7 +229,6 @@ impl<'a> PackGenerator<'a> {
             filtered_objects = self.apply_object_filter(filtered_objects, filter.as_ref())?;
         }
 
-        eprintln!("DEBUG: enumerate() method completed with {} objects", filtered_objects.len());
         Ok(filtered_objects)
     }
 
