@@ -59,15 +59,17 @@ impl<'a> Handler<'a> {
     /// Collect references for V2 protocol
     fn collect_refs_v2(&self, prefixes: &[String]) -> Result<Vec<Reference>> {
         let mut refs = Vec::new();
-        
-        // In V2, we should include HEAD as a regular reference
+
+                // In V2, we should include HEAD as a regular reference
         if let Ok(head) = self.repository.head() {
             match head.kind {
                 gix::head::Kind::Symbolic(target_ref) => {
                     // Add HEAD as a reference pointing to the same commit as the target
                     if let gix::refs::Target::Object(oid) = &target_ref.target {
-                        refs.push(ProtocolRef::Direct {
+                        refs.push(ProtocolRef::Symbolic {
                             full_ref_name: "HEAD".into(),
+                            target: target_ref.name.as_bstr().to_owned(),
+                            tag: None,
                             object: *oid,
                         });
                     }
@@ -87,82 +89,24 @@ impl<'a> Handler<'a> {
         
         // Get the reference iterator
         let refs_binding = self.repository.references().map_err(|e| Error::RefPackedBuffer(e))?;
-        let ref_iter = if prefixes.is_empty() {
-            refs_binding.all().map_err(|e| Error::RefIterInit(e))?
-        } else {
-            // For multiple prefixes, we need to collect from each prefix
-            let mut all_refs = Vec::new();
-            let all_refs_iter = refs_binding.all().map_err(|e| Error::RefIterInit(e))?;
-            
-            for reference in all_refs_iter {
-                if let Ok(reference) = reference {
-                    let ref_name = reference.name().as_bstr().to_str_lossy();
-                    for prefix in prefixes {
-                        if ref_name.starts_with(prefix) {
-                            all_refs.push(reference);
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            // Process the collected refs
-            for reference in all_refs {
-                let name = reference.name().as_bstr();
-                
-                // Check if reference should be hidden
-                if self.options.is_ref_hidden(name.to_str_lossy().as_ref()) {
-                    continue;
-                }
-                
-                match reference.target() {
-                    gix::refs::TargetRef::Symbolic(_) => {
-                        // Skip symbolic refs in V2 (handled separately)
-                        continue;
-                    }
-                    gix::refs::TargetRef::Object(oid) => {
-                        let target = oid.to_owned();
-                        let name = name.to_owned();
-                        
-                        // Get peeled value for tags
-                        let peeled = if name.starts_with_str("refs/tags/") {
-                            if let Ok(obj) = self.repository.find_object(target) {
-                                if obj.kind == gix::object::Kind::Tag {
-                                    obj.try_into_tag()
-                                        .ok()
-                                        .and_then(|tag| tag.target_id().ok())
-                                        .map(|id| id.detach())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        
-                        if let Some(peeled) = peeled {
-                            refs.push(ProtocolRef::Peeled {
-                                full_ref_name: name,
-                                tag: target,
-                                object: peeled,
-                            });
-                        } else {
-                            refs.push(ProtocolRef::Direct {
-                                full_ref_name: name,
-                                object: target,
-                            });
-                        }
-                    }
-                }
-            }
-            
-            return Ok(refs);
-        };
+
+        let mut all_refs = Vec::new();
+        let all_refs_iter = refs_binding.all().map_err(|e| Error::RefIterInit(e))?;
         
-        for reference in ref_iter {
-            let reference = reference.map_err(|e| Error::Boxed(e))?;
+        for reference in all_refs_iter {
+            if let Ok(reference) = reference {
+                let ref_name = reference.name().as_bstr().to_str_lossy();
+                for prefix in prefixes {
+                    if ref_name.starts_with(prefix) {
+                        all_refs.push(reference);
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Process the collected refs
+        for reference in all_refs {
             let name = reference.name().as_bstr();
             
             // Check if reference should be hidden
@@ -171,9 +115,18 @@ impl<'a> Handler<'a> {
             }
             
             match reference.target() {
-                gix::refs::TargetRef::Symbolic(_) => {
-                    // Skip symbolic refs in V2 (handled separately)
-                    continue;
+                gix::refs::TargetRef::Symbolic(target_ref_name) => {
+                    // We need to fetch the target object id for symbolic refs
+                    let object: Option<std::result::Result<gix::Reference<'_>, gix_ref::file::find::existing::Error>> = reference.follow();
+
+                    if let Some(Ok(resolved_ref)) = object {
+                        refs.push(ProtocolRef::Symbolic {
+                            full_ref_name: name.to_owned(),
+                            target: target_ref_name.as_bstr().to_owned(),
+                            tag: None,
+                            object: resolved_ref.target().id().to_owned(),
+                        });
+                    }
                 }
                 gix::refs::TargetRef::Object(oid) => {
                     let target = oid.to_owned();
@@ -212,6 +165,7 @@ impl<'a> Handler<'a> {
                 }
             }
         }
+
         
         Ok(refs)
     }
@@ -233,22 +187,6 @@ impl<'a> Handler<'a> {
                 
                 let symref_line = format!("symref-target:{} {}\n", name.to_str_lossy(), target_name.to_str_lossy());
                 gix_packetline::encode::data_to_write(symref_line.as_bytes(), &mut *writer)?;
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Send unborn HEAD information
-    fn send_unborn_head<W: Write>(&self, writer: &mut W) -> Result<()> {
-        // Check if HEAD is unborn (points to non-existent ref)
-        if let Ok(head_ref) = self.repository.refs.find("HEAD") {
-            if let gix::refs::Target::Symbolic(target) = head_ref.target {
-                // Check if target exists
-                if self.repository.refs.find(target.as_bstr()).is_err() {
-                    let unborn_line = format!("unborn {}\n", target.as_bstr().to_str_lossy());
-                    gix_packetline::encode::data_to_write(unborn_line.as_bytes(), writer)?;
-                }
             }
         }
         
@@ -430,47 +368,43 @@ impl<'a> Handler<'a> {
         let peel = args.get("peel").is_some();
         let unborn = args.get("unborn").is_some();
         
-        let ref_prefixes = args.get("ref-prefix")
-            .map(|s| s.split(' ').map(|p| p.to_string()).collect::<Vec<_>>())
-            .unwrap_or_default();
+        // Collect all ref-prefix arguments (they come as separate keys like "ref-prefix HEAD", "ref-prefix refs/heads/")
+        let ref_prefixes: Vec<String> = args.keys()
+            .filter_map(|key| {
+                if key.starts_with("ref-prefix ") {
+                    Some(key.strip_prefix("ref-prefix ").unwrap().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
         
         // Get references
         let refs = self.collect_refs_v2(&ref_prefixes)?;
         
         // Send references
         for reference in refs {
-            let (ref_name, target_oid, peeled) = reference.unpack();
+            let (ref_name, target_oid, peeled_oid) = reference.unpack();
+
             let target_oid = target_oid.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Unborn reference has no target"))?;
             let mut line = format!("{} {}", target_oid.to_hex(), ref_name.to_str_lossy());
-            
-            // Add symref-target for HEAD if requested
-            if symrefs && ref_name == "HEAD" {
-                if let Ok(head) = self.repository.head() {
-                    if let gix::head::Kind::Symbolic(target_ref) = head.kind {
-                        line.push_str(&format!(" symref-target:{}", target_ref.name.as_bstr().to_str_lossy()));
-                    }
+
+            // Add symref-target attribute for symbolic references when symrefs is requested
+            if symrefs {
+                if let ProtocolRef::Symbolic { target, .. } = &reference {
+                    line.push_str(&format!(" symref-target:{}", target.to_str_lossy()));
                 }
             }
             
-            // Add peeled info if requested and available
+            // Add peeled attribute for peeled references when peel is requested
             if peel {
-                if let Some(peeled_oid) = peeled {
+                if let Some(peeled_oid) = peeled_oid {
                     line.push_str(&format!(" peeled:{}", peeled_oid.to_hex()));
                 }
             }
             
             line.push('\n');
             gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer)?;
-        }
-        
-        // Handle symbolic refs if requested
-        if symrefs {
-            self.send_symrefs(&mut *writer)?;
-        }
-        
-        // Handle unborn HEAD if requested
-        if unborn {
-            self.send_unborn_head(&mut *writer)?;
         }
         
         // End with flush
