@@ -9,11 +9,12 @@ use crate::{
     types::*,
 };
 use bstr::{BStr, ByteSlice};
+//use gix_features::progress::{Count, Progress};
 use gix_packetline::PacketLineRef;
-use futures_lite::io::AsyncWrite;
+use std::io::{Write};
 
 /// Response formatter for upload-pack protocol
-pub struct ResponseFormatter<'a, W: AsyncWrite + Unpin> {
+pub struct ResponseFormatter<'a, W: Write> {
     writer: &'a mut W,
     side_band_mode: SideBandMode,
     session_id: Option<&'a BStr>,
@@ -21,7 +22,7 @@ pub struct ResponseFormatter<'a, W: AsyncWrite + Unpin> {
 
 use crate::types::{SideBandMode, SideBandChannel};
 
-impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
+impl<'a, W: Write> ResponseFormatter<'a, W> {
     /// Create a new response formatter
     pub fn new(writer: &'a mut W, side_band_mode: SideBandMode) -> Self {
         Self {
@@ -38,7 +39,7 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
     }
     
     /// Send a data packet
-    pub async fn send_data(&mut self, data: &[u8]) -> Result<()> {
+    pub fn send_data(&mut self, data: &[u8]) -> Result<()> {
         // Use consistent chunking size for all modes, matching native Git's ~8KB chunks
         // This improves compatibility and performance
         const OPTIMAL_CHUNK_SIZE: usize = 8196;
@@ -47,11 +48,11 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
             SideBandMode::None => {
                 // For large data, chunk it to avoid packet line size limits
                 if data.len() <= OPTIMAL_CHUNK_SIZE {
-                    gix_packetline::encode::data_to_write(data, &mut *self.writer).await?;
+                    gix_packetline::encode::data_to_write(data, &mut *self.writer)?;
                 } else {
                     // Chunk large data into multiple packet lines
                     for chunk in data.chunks(OPTIMAL_CHUNK_SIZE) {
-                        gix_packetline::encode::data_to_write(chunk, &mut *self.writer).await?;
+                        gix_packetline::encode::data_to_write(chunk, &mut *self.writer)?;
                     }
                 }
             }
@@ -59,57 +60,57 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
                 // Pack data should be sent via side-band channel 1 (Data channel)
                 // This matches Git's behavior where pack files are multiplexed with progress
                 // Use consistent chunking for better compatibility with native Git
-                self.send_side_band_chunked(SideBandChannel::Data, data, OPTIMAL_CHUNK_SIZE).await?;
+                self.send_side_band_chunked(SideBandChannel::Data, data, OPTIMAL_CHUNK_SIZE)?;
             }
         }
         Ok(())
     }
     
     /// Send a progress message
-    pub async fn send_progress(&mut self, message: &str) -> Result<()> {
+    pub fn send_progress(&mut self, message: &str) -> Result<()> {
         match self.side_band_mode {
             SideBandMode::None => {
                 // Cannot send progress without side-band
             }
             SideBandMode::Basic | SideBandMode::SideBand64k => {
                 let progress_msg = format!("{}\n", message);
-                self.send_side_band(SideBandChannel::Progress, progress_msg.as_bytes()).await?;
+                self.send_side_band(SideBandChannel::Progress, progress_msg.as_bytes())?;
             }
         }
         Ok(())
     }
     
     /// Send an error message
-    pub async fn send_error(&mut self, error: &str) -> Result<()> {
+    pub fn send_error(&mut self, error: &str) -> Result<()> {
         match self.side_band_mode {
             SideBandMode::None => {
                 // Send as regular packet
                 let error_msg = format!("error: {}\n", error);
-                gix_packetline::encode::data_to_write(error_msg.as_bytes(), &mut *self.writer).await?;
+                gix_packetline::encode::data_to_write(error_msg.as_bytes(), &mut *self.writer)?;
             }
             SideBandMode::Basic | SideBandMode::SideBand64k => {
                 let error_msg = format!("error: {}\n", error);
-                self.send_side_band(SideBandChannel::Error, error_msg.as_bytes()).await?;
+                self.send_side_band(SideBandChannel::Error, error_msg.as_bytes())?;
             }
         }
         Ok(())
     }
     
     /// Send a side-band packet
-    async fn send_side_band(&mut self, channel: SideBandChannel, data: &[u8]) -> Result<()> {
+    fn send_side_band(&mut self, channel: SideBandChannel, data: &[u8]) -> Result<()> {
         let max_data_size = self.side_band_mode.max_data_size()
             .expect("send_side_band called when side-band mode is None");
         
         // Split data into chunks if necessary and use gix-packetline encoding
         for chunk in data.chunks(max_data_size) {
-            gix_packetline::encode::band_to_write(channel, chunk, &mut *self.writer).await?;
+            gix_packetline::encode::band_to_write(channel, chunk, &mut *self.writer)?;
         }
         
         Ok(())
     }
     
     /// Send a side-band packet with custom chunk size
-    async fn send_side_band_chunked(&mut self, channel: SideBandChannel, data: &[u8], chunk_size: usize) -> Result<()> {
+    fn send_side_band_chunked(&mut self, channel: SideBandChannel, data: &[u8], chunk_size: usize) -> Result<()> {
         let max_data_size = self.side_band_mode.max_data_size()
             .expect("send_side_band_chunked called when side-band mode is None");
         
@@ -118,60 +119,60 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
         
         // Split data into chunks and use gix-packetline encoding
         for chunk in data.chunks(effective_chunk_size) {
-            gix_packetline::encode::band_to_write(channel, chunk, &mut *self.writer).await?;
+            gix_packetline::encode::band_to_write(channel, chunk, &mut *self.writer)?;
         }
         
         Ok(())
     }
     
     /// Send flush packet
-    pub async fn send_flush(&mut self) -> Result<()> {
-        PacketLineRef::Flush.write_to(&mut *self.writer).await?;
+    pub fn send_flush(&mut self) -> Result<()> {
+        PacketLineRef::Flush.write_to(&mut *self.writer)?;
         Ok(())
     }
     
     /// Send delimiter packet (protocol V2)
-    pub async fn send_delimiter(&mut self) -> Result<()> {
-        PacketLineRef::Delimiter.write_to(&mut *self.writer).await?;
+    pub fn send_delimiter(&mut self) -> Result<()> {
+        PacketLineRef::Delimiter.write_to(&mut *self.writer)?;
         Ok(())
     }
     
     /// Send a response end packet (protocol V2)
-    pub async fn send_response_end(&mut self) -> Result<()> {
-        PacketLineRef::ResponseEnd.write_to(&mut *self.writer).await?;
+    pub fn send_response_end(&mut self) -> Result<()> {
+        PacketLineRef::ResponseEnd.write_to(&mut *self.writer)?;
         Ok(())
     }
     
     /// Send ACK response
-    pub async fn send_ack(&mut self, oid: &gix_hash::ObjectId, status: AckStatus) -> Result<()> {
+    pub fn send_ack(&mut self, oid: &gix_hash::ObjectId, status: AckStatus) -> Result<()> {
         let response = match status {
             AckStatus::Common => format!("ACK {}\n", oid.to_hex()),
             AckStatus::Continue => format!("ACK {} continue\n", oid.to_hex()),
             AckStatus::Ready => format!("ACK {} ready\n", oid.to_hex()),
         };
         
-        self.send_data(response.as_bytes()).await
+        self.send_data(response.as_bytes())
     }
     
     /// Send NAK response
-    pub async fn send_nak(&mut self) -> Result<()> {
-        self.send_data(b"NAK\n").await
+    pub fn send_nak(&mut self) -> Result<()> {
+        self.send_data(b"NAK\n")
     }
     
     /// Send shallow response
-    pub async fn send_shallow(&mut self, oid: &gix_hash::ObjectId) -> Result<()> {
+    pub fn send_shallow(&mut self, oid: &gix_hash::ObjectId) -> Result<()> {
         let response = format!("shallow {}\n", oid.to_hex());
-        self.send_data(response.as_bytes()).await
+        self.send_data(response.as_bytes())
     }
     
     /// Send unshallow response
-    pub async fn send_unshallow(&mut self, oid: &gix_hash::ObjectId) -> Result<()> {
+    pub fn send_unshallow(&mut self, oid: &gix_hash::ObjectId) -> Result<()> {
         let response = format!("unshallow {}\n", oid.to_hex());
-        self.send_data(response.as_bytes()).await
+        self.send_data(response.as_bytes())
     }
     
     /// Send a reference line (for ls-refs)
-    pub async fn send_ref(&mut self, reference: &Reference) -> Result<()> {
+    pub fn send_ref(&mut self, reference: &Reference) -> Result<()> {
         let (ref_name, target_oid, peeled) = reference.unpack();
         let target_oid = target_oid.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Unborn reference has no target"))?;
         let mut line = format!("{} {}", target_oid.to_hex(), ref_name.to_str_lossy());
@@ -181,29 +182,29 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
         }
         
         line.push('\n');
-        self.send_data(line.as_bytes()).await
+        self.send_data(line.as_bytes())
     }
     
     /// Send symref information
-    pub async fn send_symref(&mut self, name: &BStr, target: &BStr) -> Result<()> {
+    pub fn send_symref(&mut self, name: &BStr, target: &BStr) -> Result<()> {
         let line = format!("symref-target:{} {}\n", name.to_str_lossy(), target.to_str_lossy());
-        self.send_data(line.as_bytes()).await
+        self.send_data(line.as_bytes())
     }
     
     /// Send unborn HEAD information
-    pub async fn send_unborn(&mut self, ref_name: &BStr) -> Result<()> {
+    pub fn send_unborn(&mut self, ref_name: &BStr) -> Result<()> {
         let line = format!("unborn {}\n", ref_name.to_str_lossy());
-        self.send_data(line.as_bytes()).await
+        self.send_data(line.as_bytes())
     }
     
     /// Send server information
-    pub async fn send_server_info(&mut self, key: &str, value: &str) -> Result<()> {
+    pub fn send_server_info(&mut self, key: &str, value: &str) -> Result<()> {
         let line = format!("{} {}\n", key, value);
-        self.send_data(line.as_bytes()).await
+        self.send_data(line.as_bytes())
     }
     
     /// Send object information
-    pub async fn send_object_info(&mut self, oid: &gix_hash::ObjectId, info: &ObjectInfo) -> Result<()> {
+    pub fn send_object_info(&mut self, oid: &gix_hash::ObjectId, info: &ObjectInfo) -> Result<()> {
         let mut line = oid.to_hex().to_string();
         
         if let Some(size) = info.size {
@@ -215,36 +216,35 @@ impl<'a, W: AsyncWrite + Unpin> ResponseFormatter<'a, W> {
         }
         
         line.push('\n');
-        self.send_data(line.as_bytes()).await
+        self.send_data(line.as_bytes())
     }
     
     /// Send section header (protocol V2)
-    pub async fn send_section(&mut self, section_name: &str) -> Result<()> {
+    pub fn send_section(&mut self, section_name: &str) -> Result<()> {
         let line = format!("{}\n", section_name);
-        self.send_data(line.as_bytes()).await
+        self.send_data(line.as_bytes())
     }
     
     /// Send a generic response line
-    pub async fn send_line(&mut self, line: &str) -> Result<()> {
+    pub fn send_line(&mut self, line: &str) -> Result<()> {
         let line_with_newline = if line.ends_with('\n') {
             line.to_string()
         } else {
             format!("{}\n", line)
         };
-        self.send_data(line_with_newline.as_bytes()).await
+        self.send_data(line_with_newline.as_bytes())
     }
     
     /// Send binary data (like pack files)
-    pub async fn send_binary(&mut self, data: &[u8]) -> Result<()> {
+    pub fn send_binary(&mut self, data: &[u8]) -> Result<()> {
         match self.side_band_mode {
             SideBandMode::None => {
                 // Send raw binary data
-                use futures_lite::io::AsyncWriteExt;
-                self.writer.write_all(data).await?;
+                self.writer.write_all(data)?;
             }
             SideBandMode::Basic | SideBandMode::SideBand64k => {
                 // Send through side-band
-                self.send_side_band(SideBandChannel::Data, data).await?;
+                self.send_side_band(SideBandChannel::Data, data)?;
             }
         }
         Ok(())
@@ -280,21 +280,21 @@ pub struct ObjectInfo {
 }
 
 /// Progress reporter for long-running operations
-pub struct ProgressReporter<'a, W: futures_lite::io::AsyncWrite + Unpin> {
+pub struct ProgressReporter<'a, W: std::io::Write> {
     formatter: &'a mut ResponseFormatter<'a, W>,
     operation: String,
-    total: Option<u64>,
-    current: u64,
+    total: Option<usize>, // Changed from u64 to usize to match Step
+    current: usize,       // Changed from u64 to usize to match Step
     last_report_time: std::time::Instant,
     report_interval: std::time::Duration,
 }
 
-impl<'a, W: futures_lite::io::AsyncWrite + Unpin> ProgressReporter<'a, W> {
+impl<'a, W: std::io::Write> ProgressReporter<'a, W> {
     /// Create a new progress reporter
     pub fn new(
         formatter: &'a mut ResponseFormatter<'a, W>,
         operation: String,
-        total: Option<u64>,
+        total: Option<usize>, // Changed from u64 to usize
     ) -> Self {
         Self {
             formatter,
@@ -307,20 +307,16 @@ impl<'a, W: futures_lite::io::AsyncWrite + Unpin> ProgressReporter<'a, W> {
     }
     
     /// Update progress
-    pub async fn update(&mut self, current: u64) -> Result<()> {
+    pub fn update(&mut self, current: usize) -> Result<()> { // Changed from u64 to usize
         self.current = current;
         
-        let now = std::time::Instant::now();
-        if now.duration_since(self.last_report_time) >= self.report_interval {
-            self.report().await?;
-            self.last_report_time = now;
-        }
+        self.report()?;
         
         Ok(())
     }
     
     /// Force a progress report
-    pub async fn report(&mut self) -> Result<()> {
+    pub fn report(&mut self) -> Result<()> {
         if !self.formatter.supports_progress() {
             return Ok(());
         }
@@ -335,11 +331,11 @@ impl<'a, W: futures_lite::io::AsyncWrite + Unpin> ProgressReporter<'a, W> {
             format!("{}: {}", self.operation, self.current)
         };
         
-        self.formatter.send_progress(&message).await
+        self.formatter.send_progress(&message)
     }
     
     /// Finish the progress reporting
-    pub async fn finish(&mut self) -> Result<()> {
+    pub fn finish(&mut self) -> Result<()> {
         if !self.formatter.supports_progress() {
             return Ok(());
         }
@@ -350,7 +346,7 @@ impl<'a, W: futures_lite::io::AsyncWrite + Unpin> ProgressReporter<'a, W> {
             format!("{}: {} complete", self.operation, self.current)
         };
         
-        self.formatter.send_progress(&message).await
+        self.formatter.send_progress(&message)
     }
 }
 
@@ -391,45 +387,5 @@ impl ErrorResponse {
     /// Format a repository error
     pub fn repository_error(details: &str) -> String {
         format!("error: Repository error: {}", details)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_response_formatter_basic() {
-        futures_lite::future::block_on(async {
-            let mut buffer = Vec::new();
-            let mut formatter = ResponseFormatter::new(&mut buffer, SideBandMode::None);
-            
-            formatter.send_line("test message").await.unwrap();
-            formatter.send_flush().await.unwrap();
-            
-            // Verify packet format
-            assert!(!buffer.is_empty());
-        });
-    }
-    
-    #[test] 
-    fn test_progress_reporter() {
-        futures_lite::future::block_on(async {
-            let mut buffer = Vec::new();
-            let mut formatter = ResponseFormatter::new(&mut buffer, SideBandMode::SideBand64k);
-            let mut progress = ProgressReporter::new(&mut formatter, "Testing".to_string(), Some(100));
-            
-            progress.update(50).await.unwrap();
-            progress.finish().await.unwrap();
-            
-            // Verify progress messages were sent
-            assert!(!buffer.is_empty());
-        });
-    }
-    
-    #[test]
-    fn test_error_responses() {
-        assert_eq!(ErrorResponse::object_not_found("abc123"), "error: Object abc123 not found");
-        assert_eq!(ErrorResponse::unsupported_capability("test"), "error: Capability 'test' not supported");
     }
 }

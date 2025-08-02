@@ -14,6 +14,7 @@ pub mod capabilities;
 pub mod handshake;
 pub mod negotiation;
 pub mod pack_generation;
+pub mod response;
 
 /// The main upload-pack server implementation
 #[derive(Debug)]

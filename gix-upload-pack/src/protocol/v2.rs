@@ -336,25 +336,72 @@ impl<'a> Handler<'a> {
     ) -> Result<HashMap<String, String>> {
         let mut args = HashMap::new();
         
-        while let Some(line_result) = reader.read_line() {
-            let line = line_result??;
-            if matches!(line, gix_packetline::PacketLineRef::Flush) {
+        loop {
+            // Peek at the next line to see if it's a command argument or fetch parameter
+            let should_break = match reader.peek_line() {
+                Some(Ok(Ok(line))) => {
+                    if matches!(line, gix_packetline::PacketLineRef::Flush) {
+                        true // Will consume the flush below
+                    } else if let Some(line_data) = line.as_slice() {
+                        let line_str = std::str::from_utf8(line_data)
+                            .map_err(|_| Error::custom("Invalid UTF-8 in argument line"))?
+                            .trim();
+                        
+                        // Stop parsing arguments if we hit fetch-specific commands
+                        if line_str.starts_with("want ") || 
+                           line_str.starts_with("have ") || 
+                           line_str.starts_with("shallow ") ||
+                           line_str.starts_with("deepen") ||
+                           line_str == "done" {
+                            eprintln!("Debug: Stopping argument parsing at fetch parameter: {}", line_str);
+                            true // Don't consume this line, leave it for read_fetch_parameters
+                        } else {
+                            false // This is an argument line, will process it below
+                        }
+                    } else {
+                        false
+                    }
+                }
+                Some(Ok(Err(_))) => {
+                    true // Decode error, break
+                }
+                Some(Err(_)) => {
+                    true // IO error, break
+                }
+                None => {
+                    true // EOF
+                }
+            };
+            
+            if should_break {
+                // Only consume flush packets, leave fetch parameters for later
+                if let Some(Ok(Ok(line))) = reader.peek_line() {
+                    if matches!(line, gix_packetline::PacketLineRef::Flush) {
+                        reader.read_line(); // consume the flush
+                    }
+                }
                 break;
             }
             
-            if let Some(line_data) = line.as_slice() {
-                let line_str = std::str::from_utf8(line_data)
-                    .map_err(|_| Error::custom("Invalid UTF-8 in argument line"))?
-                    .trim();
-                
-                if let Some(equals_pos) = line_str.find('=') {
-                    let key = line_str[..equals_pos].to_string();
-                    let value = line_str[equals_pos + 1..].to_string();
-                    args.insert(key, value);
-                } else {
-                    // Flag argument (no value)
-                    args.insert(line_str.to_string(), String::new());
+            // Now consume the line we know is an argument
+            if let Some(line_result) = reader.read_line() {
+                let line = line_result??;
+                if let Some(line_data) = line.as_slice() {
+                    let line_str = std::str::from_utf8(line_data)
+                        .map_err(|_| Error::custom("Invalid UTF-8 in argument line"))?
+                        .trim();
+                    
+                    if let Some(equals_pos) = line_str.find('=') {
+                        let key = line_str[..equals_pos].to_string();
+                        let value = line_str[equals_pos + 1..].to_string();
+                        args.insert(key, value);
+                    } else {
+                        // Flag argument (no value)
+                        args.insert(line_str.to_string(), String::new());
+                    }
                 }
+            } else {
+                break;
             }
         }
         
