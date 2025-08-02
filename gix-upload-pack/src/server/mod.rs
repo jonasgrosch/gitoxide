@@ -102,19 +102,24 @@ impl Server {
         handler.handle_session(input, output, &mut session)
     }
     
-    /// Detect protocol version from environment or default
+    /// Detect protocol version from environment variable (matching native git's determine_protocol_version_server)
     fn detect_protocol_version(&self) -> Result<ProtocolVersion> {
-        // Check GIT_PROTOCOL environment variable
+        // Check GIT_PROTOCOL environment variable exactly like native git
         if let Ok(protocol) = std::env::var("GIT_PROTOCOL") {
             match protocol.as_str() {
                 "version=0" => Ok(ProtocolVersion::V0),
-                "version=1" => Ok(ProtocolVersion::V1),
+                "version=1" => Ok(ProtocolVersion::V1), 
                 "version=2" => Ok(ProtocolVersion::V2),
-                _ => Ok(ProtocolVersion::V1), // Default fallback
+                _ => {
+                    // Invalid protocol version - native git would return protocol_unknown_version
+                    // For now, fall back to v0 (most conservative)
+                    Ok(ProtocolVersion::V0)
+                }
             }
         } else {
-            // For our testing, default to V2 since we want to test the fetch functionality
-            Ok(ProtocolVersion::V2)
+            // No GIT_PROTOCOL environment variable - default to v0 like native git
+            // Native git uses v0 as the default when no protocol is specified
+            Ok(ProtocolVersion::V0)
         }
     }
     

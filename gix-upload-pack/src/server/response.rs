@@ -18,6 +18,9 @@ pub struct ResponseFormatter<'a, W: Write> {
     writer: &'a mut W,
     side_band_mode: SideBandMode,
     session_id: Option<&'a BStr>,
+    no_progress: bool,
+    buffer: Vec<u8>, // Internal buffer for optimal chunk sizing
+    optimal_chunk_size: usize,
 }
 
 use crate::types::{SideBandMode, SideBandChannel};
@@ -29,6 +32,21 @@ impl<'a, W: Write> ResponseFormatter<'a, W> {
             writer,
             side_band_mode,
             session_id: None,
+            no_progress: false,
+            buffer: Vec::new(),
+            optimal_chunk_size: 8191,
+        }
+    }
+    
+    /// Create a new response formatter with no_progress flag
+    pub fn new_with_progress_control(writer: &'a mut W, side_band_mode: SideBandMode, no_progress: bool) -> Self {
+        Self {
+            writer,
+            side_band_mode,
+            session_id: None,
+            no_progress,
+            buffer: Vec::new(),
+            optimal_chunk_size: 8191,
         }
     }
     
@@ -40,30 +58,7 @@ impl<'a, W: Write> ResponseFormatter<'a, W> {
     
     /// Send a data packet
     pub fn send_data(&mut self, data: &[u8]) -> Result<()> {
-        // Use consistent chunking size for all modes, matching native Git's ~8KB chunks
-        // This improves compatibility and performance
-        const OPTIMAL_CHUNK_SIZE: usize = 8196;
-        
-        match self.side_band_mode {
-            SideBandMode::None => {
-                // For large data, chunk it to avoid packet line size limits
-                if data.len() <= OPTIMAL_CHUNK_SIZE {
-                    gix_packetline::encode::data_to_write(data, &mut *self.writer)?;
-                } else {
-                    // Chunk large data into multiple packet lines
-                    for chunk in data.chunks(OPTIMAL_CHUNK_SIZE) {
-                        gix_packetline::encode::data_to_write(chunk, &mut *self.writer)?;
-                    }
-                }
-            }
-            SideBandMode::Basic | SideBandMode::SideBand64k => {
-                // Pack data should be sent via side-band channel 1 (Data channel)
-                // This matches Git's behavior where pack files are multiplexed with progress
-                // Use consistent chunking for better compatibility with native Git
-                self.send_side_band_chunked(SideBandChannel::Data, data, OPTIMAL_CHUNK_SIZE)?;
-            }
-        }
-        Ok(())
+        self.send_data_direct(data)
     }
     
     /// Send a progress message
@@ -261,12 +256,54 @@ impl<'a, W: Write> ResponseFormatter<'a, W> {
     
     /// Check if progress messages are supported
     pub fn supports_progress(&self) -> bool {
-        self.side_band_mode.supports_channel(SideBandChannel::Progress)
+        !self.no_progress && self.side_band_mode.supports_channel(SideBandChannel::Progress)
     }
     
     /// Check if error messages are supported
     pub fn supports_errors(&self) -> bool {
         self.side_band_mode.supports_channel(SideBandChannel::Error)
+    }
+
+    /// Manually flush any buffered data (useful at end of pack transmission)
+    pub fn flush_buffer_if_needed(&mut self) -> Result<()> {
+        self.flush_buffer()
+    }
+
+    /// Flush the internal buffer
+    fn flush_buffer(&mut self) -> Result<()> {
+        if !self.buffer.is_empty() {
+            let buffer_data = std::mem::take(&mut self.buffer);
+            self.send_data_direct(&buffer_data)?;
+        }
+        Ok(())
+    }
+
+    /// Send data directly without buffering (internal use)
+    fn send_data_direct(&mut self, data: &[u8]) -> Result<()> {
+        // Use consistent chunking size for all modes, matching native Git's ~8KB chunks
+        // This improves compatibility and performance
+        const OPTIMAL_CHUNK_SIZE: usize = 8191;
+        
+        match self.side_band_mode {
+            SideBandMode::None => {
+                // For large data, chunk it to avoid packet line size limits
+                if data.len() <= OPTIMAL_CHUNK_SIZE {
+                    gix_packetline::encode::data_to_write(data, &mut *self.writer)?;
+                } else {
+                    // Chunk large data into multiple packet lines
+                    for chunk in data.chunks(OPTIMAL_CHUNK_SIZE) {
+                        gix_packetline::encode::data_to_write(chunk, &mut *self.writer)?;
+                    }
+                }
+            }
+            SideBandMode::Basic | SideBandMode::SideBand64k => {
+                // Pack data should be sent via side-band channel 1 (Data channel)
+                // This matches Git's behavior where pack files are multiplexed with progress
+                // Use consistent chunking for better compatibility with native Git
+                self.send_side_band_chunked(SideBandChannel::Data, data, OPTIMAL_CHUNK_SIZE)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -283,10 +320,13 @@ pub struct ObjectInfo {
 pub struct ProgressReporter<'a, W: std::io::Write> {
     formatter: &'a mut ResponseFormatter<'a, W>,
     operation: String,
-    total: Option<usize>, // Changed from u64 to usize to match Step
-    current: usize,       // Changed from u64 to usize to match Step
+    total: Option<usize>,
+    current: usize,
     last_report_time: std::time::Instant,
     report_interval: std::time::Duration,
+    last_percent: Option<u32>, // Track last reported percentage like Git does
+    update_counter: usize, // Track number of updates to batch time checks
+    time_check_interval: usize, // Only check time every N updates
 }
 
 impl<'a, W: std::io::Write> ProgressReporter<'a, W> {
@@ -294,7 +334,7 @@ impl<'a, W: std::io::Write> ProgressReporter<'a, W> {
     pub fn new(
         formatter: &'a mut ResponseFormatter<'a, W>,
         operation: String,
-        total: Option<usize>, // Changed from u64 to usize
+        total: Option<usize>,
     ) -> Self {
         Self {
             formatter,
@@ -302,15 +342,35 @@ impl<'a, W: std::io::Write> ProgressReporter<'a, W> {
             total,
             current: 0,
             last_report_time: std::time::Instant::now(),
-            report_interval: std::time::Duration::from_millis(100), // Report every 100ms
+            report_interval: std::time::Duration::from_millis(1000), // Report every 1000ms
+            last_percent: None,
+            update_counter: 0,
+            time_check_interval: 100, // Only check time every 100 updates for unknown totals
         }
     }
     
-    /// Update progress
-    pub fn update(&mut self, current: usize) -> Result<()> { // Changed from u64 to usize
+    /// Update progress (Git-style: only report on percentage changes)
+    pub fn update(&mut self, current: usize) -> Result<()> {
         self.current = current;
         
-        self.report()?;
+        // Only report if percentage changed (like Git does)
+        if let Some(total) = self.total {
+            if total > 0 {
+                let percent = ((current * 100) / total) as u32;
+                if self.last_percent.map_or(true, |last| percent != last) {
+                    self.last_percent = Some(percent);
+                    self.report()?;
+                }
+            }
+        } else {
+            // For unknown totals, only check time occasionally to reduce overhead
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(self.last_report_time);
+            if elapsed >= self.report_interval {
+                self.last_report_time = now;
+                self.report()?;
+            }
+        }
         
         Ok(())
     }
@@ -322,11 +382,12 @@ impl<'a, W: std::io::Write> ProgressReporter<'a, W> {
         }
         
         let message = if let Some(total) = self.total {
-            format!("{}: {}/{} ({:.1}%)", 
+            let percent = if total > 0 { (self.current * 100) / total } else { 0 };
+            format!("{}: {}% ({}/{})", 
                    self.operation, 
+                   percent,
                    self.current, 
-                   total,
-                   (self.current as f64 / total as f64) * 100.0)
+                   total)
         } else {
             format!("{}: {}", self.operation, self.current)
         };
@@ -334,19 +395,50 @@ impl<'a, W: std::io::Write> ProgressReporter<'a, W> {
         self.formatter.send_progress(&message)
     }
     
-    /// Finish the progress reporting
+    /// Finish the progress reporting (Git-style with "done.")
     pub fn finish(&mut self) -> Result<()> {
         if !self.formatter.supports_progress() {
             return Ok(());
         }
         
         let message = if let Some(total) = self.total {
-            format!("{}: {} complete", self.operation, total)
+            // Git format: "Counting objects: 100% (45212/45212), done."
+            format!("{}: 100% ({}/{}), done.", self.operation, total, total)
         } else {
-            format!("{}: {} complete", self.operation, self.current)
+            format!("{}: {}, done.", self.operation, self.current)
         };
         
         self.formatter.send_progress(&message)
+    }
+    
+    /// Get the total if known
+    pub fn total(&self) -> Option<usize> {
+        self.total
+    }
+}
+
+impl<'a, W: Write> Write for ResponseFormatter<'a, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Add data to internal buffer
+        self.buffer.extend_from_slice(buf);
+        
+        // If buffer has reached optimal size, flush it
+        if self.buffer.len() >= self.optimal_chunk_size {
+            self.flush_buffer()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        
+        // Always report that we consumed all the input bytes
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Flush our internal buffer first
+        self.flush_buffer()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        
+        // Then flush the underlying writer
+        self.writer.flush()
     }
 }
 

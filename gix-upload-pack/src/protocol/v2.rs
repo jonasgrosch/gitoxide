@@ -475,20 +475,28 @@ impl<'a> Handler<'a> {
             // In V2, we can send pack immediately if we have wants
             // and don't need negotiation (simplified for this example)
             
-            // Send acknowledgments section
-            gix_packetline::encode::data_to_write(b"acknowledgments\n", &mut *writer)?;
-            
-            // Find common commits (simplified)
+            // Find common commits and collect acknowledgments
+            let mut acks = Vec::new();
             for have in &session.negotiation.haves {
                 if self.repository.objects.contains(have) {
                     session.negotiation.common.insert(*have);
-                    let ack_line = format!("ACK {}\n", have.to_hex());
-                    gix_packetline::encode::data_to_write(ack_line.as_bytes(), &mut *writer)?;
+                    acks.push(*have);
                 }
             }
             
-            // End acknowledgments
-            gix_packetline::PacketLineRef::Flush.write_to(&mut *writer)?;
+            // Only send acknowledgments section if we have acknowledgments to send
+            if !acks.is_empty() {
+                // Send acknowledgments section
+                gix_packetline::encode::data_to_write(b"acknowledgments\n", &mut *writer)?;
+                
+                for ack in acks {
+                    let ack_line = format!("ACK {}\n", ack.to_hex());
+                    gix_packetline::encode::data_to_write(ack_line.as_bytes(), &mut *writer)?;
+                }
+                
+                // End acknowledgments
+                gix_packetline::PacketLineRef::Flush.write_to(&mut *writer)?;
+            }
             
             // Send packfile section
             gix_packetline::encode::data_to_write(b"packfile\n", &mut *writer)?;

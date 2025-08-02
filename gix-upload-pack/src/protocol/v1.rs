@@ -101,11 +101,9 @@ impl<'a> Handler<'a> {
         for reference in self.repository.references().map_err(|e| Error::RefPackedBuffer(e))?.all().map_err(|e| Error::RefIterInit(e))? {
             let reference = reference.map_err(|e| Error::Boxed(e))?;
             let name = reference.name().as_bstr().to_owned();
-            eprintln!("Debug: Found reference: {}", name.to_str_lossy());
             
             // Check if reference should be hidden
             if self.options.is_ref_hidden(name.to_str_lossy().as_ref()) {
-                eprintln!("Debug: Reference {} is hidden, skipping", name.to_str_lossy());
                 continue;
             }
             

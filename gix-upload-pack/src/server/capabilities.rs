@@ -263,7 +263,7 @@ impl<'a> CapabilityManager<'a> {
     }
     
     /// Validate V2 command arguments using gix-protocol
-    /// Validate a V2 command with arguments using gix-protocol integration  
+    /// Now that we've fixed gix-protocol to accept standard git capabilities
     pub fn validate_v2_command(
         &self, 
         command: crate::types::Command, 
@@ -273,7 +273,7 @@ impl<'a> CapabilityManager<'a> {
         // Create features from server capabilities
         let features = command.default_features(ProtocolVersion::V2, server_caps);
         
-        // Validate using gix-protocol's validation
+        // Validate using gix-protocol's validation (now fixed to accept standard capabilities)
         command.validate_argument_prefixes(ProtocolVersion::V2, server_caps, args, &features)
             .map_err(|e| Error::ProtocolParsing(format!("Command validation failed: {}", e)))
     }
