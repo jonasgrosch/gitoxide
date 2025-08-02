@@ -20,7 +20,7 @@ path = "examples/simple_server.rs"
 [dependencies]
 # Core gitoxide crates
 gix = { version = "0.73", path = "../gix", default-features = false, features = ["revision"] }
-gix-protocol = { version = "0.51", path = "../gix-protocol", features = ["handshake", "fetch", "async-client"] }
+gix-protocol = { version = "0.51", path = "../gix-protocol", features = ["handshake", "fetch", "blocking-client"] }
 gix-transport = { version = "0.48.0", path = "../gix-transport" }
 gix-pack = { version = "0.60.0", path = "../gix-pack", features = ["streaming-input"] }
 gix-packetline = { version = "0.19.1", path = "../gix-packetline" }
@@ -42,10 +42,6 @@ thiserror = "1.0"
 bstr = { version = "1.6", default-features = false, features = ["std"] }
 smallvec = "1.11"
 
-# Optional async support
-futures-lite = { version = "2.0", optional = true }
-async-trait = { version = "0.1", optional = true }
-
 # Tracing and logging
 tracing = { version = "0.1", optional = true }
 clap = { version = "4.5.42", features = ["derive"] }
@@ -58,11 +54,10 @@ predicates = "3.0"
 serial_test = "3.0"
 
 [features]
-default = ["async"]
+default = ["blocking"]
 
-# Transport features
+# Transport features - now synchronous only
 blocking = ["gix-transport/blocking-client", "gix-packetline/blocking-io"]
-async = ["gix-transport/async-client", "gix-packetline/async-io", "futures-lite", "async-trait"]
 
 # Protocol features  
 serde = ["gix-protocol/serde", "gix-transport/serde"]

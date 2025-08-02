@@ -574,82 +574,6 @@ impl<'a> Handler<'a> {
         Ok(())
     }
     
-    /// Handle object-info command
-    fn handle_object_info<R: BufRead, W: Write>(
-        &self,
-        reader: &mut StreamingPeekableIter<R>,
-        writer: &mut W,
-        args: &HashMap<String, String>,
-        _session: &mut SessionContext,
-    ) -> Result<()> {
-        // Get server capabilities for validation
-        let server_caps = self.capability_manager.build_server_capabilities(ProtocolVersion::V2)?;
-        
-        // Validate object-info command arguments
-        let args_vec: Vec<bstr::BString> = args.iter()
-            .map(|(k, v)| if v.is_empty() { k.as_bytes().into() } else { format!("{}={}", k, v).into() })
-            .collect();
-        
-        self.capability_manager.validate_v2_command(Command::ObjectInfo, &args_vec, &server_caps)?;
-
-        // Check if size information is requested (currently the only supported attribute)
-        let request_size = args.get("size").is_some();
-        
-        if !request_size {
-            return Err(Error::custom("object-info requires 'size' argument"));
-        }
-        
-        // Send the attributes line first (per spec: attrs = "size")
-        gix_packetline::encode::data_to_write(b"size\n", &mut *writer)?;
-        
-        // Read object OIDs from the request
-        let mut oids = Vec::new();
-        while let Some(line_result) = reader.read_line() {
-            let line = line_result??;
-            if matches!(line, gix_packetline::PacketLineRef::Flush) {
-                break;
-            }
-            
-            if let Some(line_data) = line.as_slice() {
-                if let Some(oid_line) = line_data.strip_prefix(b"oid ") {
-                    let oid_str = std::str::from_utf8(oid_line.trim_ascii())
-                        .map_err(|_| Error::custom("Invalid UTF-8 in oid line"))?;
-                    
-                    let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
-                        .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
-                    
-                    oids.push(oid);
-                } else {
-                    // Skip unknown lines
-                    eprintln!("Debug: Skipping unknown object-info line: {:?}", 
-                             std::str::from_utf8(line_data).unwrap_or("<invalid utf8>"));
-                }
-            }
-        }
-        
-        // Process each requested object and send obj-info lines
-        for oid in oids {
-            match self.repository.find_object(oid) {
-                Ok(obj) => {
-                    // Send obj-info: obj-id SP obj-size
-                    let info_line = format!("{} {}\n", oid.to_hex(), obj.data.len());
-                    gix_packetline::encode::data_to_write(info_line.as_bytes(), &mut *writer)?;
-                }
-                Err(_) => {
-                    // Object not found - per spec, we might skip missing objects
-                    // or we could send an error. The spec isn't entirely clear,
-                    // but Git's implementation typically skips missing objects silently
-                    eprintln!("Debug: Object not found: {}", oid.to_hex());
-                }
-            }
-        }
-        
-        // End response with flush packet
-        gix_packetline::PacketLineRef::Flush.write_to(writer)?;
-        
-        Ok(())
-    }
-    
     /// Read fetch parameters from client
     fn read_fetch_parameters<R: BufRead>(
         &self,
@@ -719,7 +643,11 @@ impl<'a> ProtocolHandler for Handler<'a> {
                 let cmd_str = std::str::from_utf8(cmd_line.trim_ascii())
                     .map_err(|_| Error::custom("Invalid UTF-8 in command line"))?;
 
-                    command = Command::from_str(cmd_str);
+                    command = match cmd_str {
+                        "ls-refs" => Some(Command::LsRefs),
+                        "fetch" => Some(Command::Fetch),
+                        _ => None, // Unsupported command
+                    };
                     break;
                 }
             }
@@ -737,9 +665,6 @@ impl<'a> ProtocolHandler for Handler<'a> {
             }
             Some(Command::Fetch) => {
                 self.handle_fetch(&mut line_reader, &mut output, &args, session)?;
-            }
-            Some(Command::ObjectInfo) => {
-                self.handle_object_info(&mut line_reader, &mut output, &args, session)?;
             }
             None => {
                 return Err(Error::custom(format!("Unsupported command: {:?}", command)));

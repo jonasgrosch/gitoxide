@@ -127,21 +127,6 @@ impl<'a> CapabilityManager<'a> {
         }
 
         caps.push(format!("ls-refs={}", ls_refs_cap_strings.join(" ")));
-
-        if self.options.enable_object_info {
-            // object-info command with its features
-            let object_info_command = Command::ObjectInfo;
-            let object_info_features = object_info_command.default_features(ProtocolVersion::V2, &default_caps);
-            let mut object_info_cap_strings = vec!["size".to_string()];
-
-            for (feature, _) in &object_info_features {
-                if *feature != "object-info" && !object_info_cap_strings.contains(&feature.to_string()) {
-                    object_info_cap_strings.push(feature.to_string());
-                }
-            }
-
-            caps.push(format!("object-info={}", object_info_cap_strings.join(" ")));
-        }
         
         caps.join("\n")
     }
@@ -168,9 +153,6 @@ impl<'a> CapabilityManager<'a> {
         
         // ls-refs command
         caps.push("ls-refs=symrefs peel unborn".to_string());
-
-        // object-info command
-        let object_info_caps = vec!["size", "type"];
         
         caps.join("\n")
     }

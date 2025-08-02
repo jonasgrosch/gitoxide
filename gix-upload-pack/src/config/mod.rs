@@ -336,15 +336,7 @@ impl ServerOptions {
     }
     
     /// Check if a reference should be hidden
-    pub fn is_ref_hidden(&self, ref_name: &str) -> bool {
-        // TODO:: Implement proper pattern matching for hidden refs / check what the upstream implementation is
-        if ref_name.starts_with("refs/pull/") || 
-           ref_name.starts_with("refs/merge-requests/") ||
-           ref_name.starts_with("refs/changes/") ||
-           ref_name.starts_with("refs/remotes/") {
-            return true;
-        }
-        
+    pub fn is_ref_hidden(&self, ref_name: &str) -> bool {        
         // Check user-configured hidden refs
         for pattern in &self.hidden_refs {
             if let Ok(pattern) = gix_pathspec::Pattern::from_bytes(pattern, gix_pathspec::Defaults::default()) {

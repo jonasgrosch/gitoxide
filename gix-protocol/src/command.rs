@@ -12,17 +12,6 @@ impl Command {
         match self {
             Command::LsRefs => "ls-refs",
             Command::Fetch => "fetch",
-            Command::ObjectInfo => "object-info",
-        }
-    }
-
-    /// Parse the command from a string, returning `None` if it doesn't match.
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "ls-refs" => Some(Command::LsRefs),
-            "fetch" => Some(Command::Fetch),
-            "object-info" => Some(Command::ObjectInfo),
-            _ => None,
         }
     }
 }
@@ -64,7 +53,6 @@ mod with_io {
                     // wait-for-done feature
                     "wait-for-done",
                 ],
-                Command::ObjectInfo => &[],
             }
         }
 
@@ -99,7 +87,6 @@ mod with_io {
                         "wait-for-done",
                     ],
                 },
-                Command::ObjectInfo => &[],
             }
         }
 
@@ -122,7 +109,6 @@ mod with_io {
                     )
                     .collect(),
                 Command::LsRefs => vec![b"symrefs".as_bstr().to_owned(), b"peel".as_bstr().to_owned()],
-                Command::ObjectInfo => vec![],
             }
         }
 
@@ -170,7 +156,6 @@ mod with_io {
                     }
                 },
                 Command::LsRefs => vec![],
-                Command::ObjectInfo => vec![],
             }
         }
         /// Return an error if the given `arguments` and `features` don't match what's statically known.
