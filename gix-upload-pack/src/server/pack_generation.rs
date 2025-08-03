@@ -55,14 +55,7 @@ impl ObjectCount {
 }
 
 impl RepositoryFindAdapter {
-    fn new(repository: &Repository) -> Self {
-        let mut objects = repository.objects.clone().into_inner();
-        // Configure the handle to prevent pack unloading, which is required for
-        // advanced pack operations like delta compression
-        objects.prevent_pack_unload();
-
-        Self { objects }
-    }
+    // Constructor is handled by PackGenerator::create_optimized_find_adapter
 }
 
 impl gix_pack::Find for RepositoryFindAdapter {
@@ -127,10 +120,6 @@ pub struct PackStats {
 struct PackConfig {
     threads: usize,
     window: usize,
-    depth: u32,
-    window_memory: u64,
-    delta_cache_size: u64,
-    delta_cache_limit: u32,
 }
 
 impl<'a> PackGenerator<'a> {
@@ -162,21 +151,16 @@ impl<'a> PackGenerator<'a> {
                 .min(8) as usize,
             // Larger window for better delta compression but not too large to avoid memory pressure
             window: config.integer("pack.window").unwrap_or(50).max(10).min(250) as usize,
-            // Reasonable depth for good compression without excessive CPU time
-            depth: config.integer("pack.depth").unwrap_or(50).max(10).min(100) as u32,
-            // Optimize memory settings for performance
-            window_memory: config.integer("pack.windowMemory").unwrap_or(512 * 1024 * 1024).max(0) as u64,
-            delta_cache_size: config
-                .integer("pack.deltaCacheSize")
-                .unwrap_or(512 * 1024 * 1024)
-                .max(0) as u64,
-            delta_cache_limit: config.integer("pack.deltaCacheLimit").unwrap_or(2000).max(0) as u32,
         }
     }
 
     /// Generate a pack file using gix-pack infrastructure with optimized buffer management
     pub fn generate_pack<W: Write>(&self, mut writer: W, session: &SessionContext) -> Result<PackStats> {
         let start_time = std::time::Instant::now();
+        
+        eprintln!("Debug: Pack generation called with capabilities: thin_pack={}, ofs_delta={}, no_progress={}, side_band={:?}", 
+                 session.capabilities.thin_pack, session.capabilities.ofs_delta, 
+                 session.capabilities.no_progress, session.capabilities.side_band);
 
         // Step 1: Prepare minimal object IDs (just wants, let gix-pack do the expansion)
         let prepare_start = std::time::Instant::now();
@@ -228,7 +212,7 @@ impl<'a> PackGenerator<'a> {
 
     /// Prepare objects using optimized commit traversal
     fn prepare_minimal_objects(&self, session: &SessionContext) -> Result<Vec<gix_hash::ObjectId>> {
-        let prepare_start = std::time::Instant::now();
+        let prepare_start: std::time::Instant = std::time::Instant::now();
 
         // Create sets for efficient lookup
         let haves: std::collections::HashSet<_> = session.negotiation.haves.iter().collect();
@@ -319,31 +303,15 @@ impl<'a> PackGenerator<'a> {
         let count_start = std::time::Instant::now();
 
         // Set up sideband progress reporting
-        let formatter_start = std::time::Instant::now();
         let mut formatter = ResponseFormatter::new_with_progress_control(
             writer,
             session.capabilities.side_band,
             session.capabilities.no_progress,
         );
-        let mut progress_reporter =
-            ProgressReporter::new(&mut formatter, "Counting objects".to_string(), Some(object_ids.len()));
-        let formatter_duration = formatter_start.elapsed();
-        eprintln!("Count objects timing: Formatter setup took {:?}", formatter_duration);
 
         // Start the gix-pack counting with optimized adapter and Git-native configuration
-        let adapter_start = std::time::Instant::now();
         let find_adapter = self.create_optimized_find_adapter();
-        let adapter_duration = adapter_start.elapsed();
-        eprintln!(
-            "Count objects timing: Find adapter creation took {:?}",
-            adapter_duration
-        );
-
-        // Use Git-native pack configuration for optimal compatibility
-        let config_start = std::time::Instant::now();
         let pack_config = self.get_pack_config();
-        let config_duration = config_start.elapsed();
-        eprintln!("Count objects timing: Pack config retrieval took {:?}", config_duration);
 
         // For now, always use TreeContents to match our original behavior
         // The TreeAdditionsComparedToAncestor mode might be filtering too aggressively
@@ -379,6 +347,13 @@ impl<'a> PackGenerator<'a> {
             let filter_duration = filter_start.elapsed();
             eprintln!("Count objects timing: Object filtering took {:?}", filter_duration);
         }
+        formatter.send_progress(&format!(
+            "Enumerating objects: {}, done.",
+            stats.total_objects
+        ))?;
+
+        let mut progress_reporter =
+        ProgressReporter::new(&mut formatter, "Counting objects".to_string(), Some(stats.total_objects));
 
         let _actual_count = counts.iter().fold(ObjectCount::default(), |mut c, _e| {
             c.add(gix_pack::data::output::entry::Kind::Base(gix_object::Kind::Blob));
@@ -400,266 +375,6 @@ impl<'a> PackGenerator<'a> {
         Ok((counts, stats))
     }
 
-    /// DEPRECATED: Collect object IDs using gix revision walking with progress reporting
-    /// This method is now replaced by prepare_minimal_objects + count_objects_with_expansion
-    #[allow(dead_code)]
-    fn enumerate<W: Write>(&self, writer: &mut W, session: &SessionContext) -> Result<Vec<gix_hash::ObjectId>> {
-        let enumerate_start = std::time::Instant::now();
-
-        // Create formatter for progress reporting
-        let formatter_start = std::time::Instant::now();
-        let mut formatter = ResponseFormatter::new_with_progress_control(
-            writer,
-            session.capabilities.side_band,
-            session.capabilities.no_progress,
-        );
-        let formatter_duration = formatter_start.elapsed();
-        eprintln!("Enumeration timing: Formatter creation took {:?}", formatter_duration);
-
-        // Start progress reporting for object collection
-        let mut progress_reporter = ProgressReporter::new(
-            &mut formatter,
-            "Enumerating objects".to_string(),
-            None, // We don't know total count upfront
-        );
-
-        // Use optimized HashSet with better capacity estimation
-        let estimated_capacity = session.negotiation.wants.len() * 100; // Rough estimate
-        let mut objects = HashSet::with_capacity(estimated_capacity);
-
-        // Filter wants to only include objects we don't already have and dereference tags to commits
-        let wants_processing_start = std::time::Instant::now();
-        let mut commit_wants = Vec::new();
-        let mut non_commit_objects = Vec::new();
-
-        for want in &session.negotiation.wants {
-            if session.negotiation.common.iter().any(|c| c == want)
-                || session.negotiation.haves.iter().any(|h| h == want)
-            {
-                continue;
-            }
-
-            // Use type-specific methods for better performance and type safety
-            if let Ok(commit) = self.repository.find_commit(*want) {
-                commit_wants.push(*want);
-            } else if let Ok(tag) = self.repository.find_tag(*want) {
-                // Add the tag itself to objects
-                non_commit_objects.push(*want);
-
-                // Try to get the target and add it if it's a commit
-                if let Ok(target_id) = tag.target_id() {
-                    let target_id = target_id.detach();
-                    if let Ok(_) = self.repository.find_commit(target_id) {
-                        commit_wants.push(target_id);
-                    } else {
-                        use gix_object::Exists;
-                        if self.repository.exists(&target_id) {
-                            non_commit_objects.push(target_id);
-                        }
-                    }
-                }
-            } else {
-                use gix_object::Exists;
-                if self.repository.exists(want) {
-                    // For trees and blobs, just add them directly
-                    non_commit_objects.push(*want);
-                }
-            }
-            // Skip missing objects (no else clause needed)
-        }
-
-        // Add non-commit objects directly to our set
-        for obj_id in non_commit_objects {
-            objects.insert(obj_id);
-
-            // If it's a tree, traverse it - use type-specific method
-            if let Ok(_tree) = self.repository.find_tree(obj_id) {
-                self.traverse_tree(obj_id, &mut objects)?;
-            }
-        }
-
-        let wants_processing_duration = wants_processing_start.elapsed();
-        eprintln!(
-            "Enumeration timing: Wants processing took {:?}",
-            wants_processing_duration
-        );
-
-        if commit_wants.is_empty() {
-            progress_reporter.finish()?;
-            let filtered_objects: Vec<_> = objects.into_iter().collect();
-            let enumerate_total_duration = enumerate_start.elapsed();
-            eprintln!(
-                "Enumeration timing: Total enumeration (no commits) took {:?}",
-                enumerate_total_duration
-            );
-            return Ok(filtered_objects);
-        }
-
-        // Create revision walker starting from commit wants, excluding haves and common
-        let revwalk_setup_start = std::time::Instant::now();
-        let mut excluded_commits: Vec<_> = session
-            .negotiation
-            .haves
-            .iter()
-            .chain(session.negotiation.common.iter())
-            .filter(|id| {
-                // Only exclude commits, not other object types - use type-specific method
-                self.repository.find_commit(**id).is_ok()
-            })
-            .copied()
-            .collect();
-        excluded_commits.sort();
-        excluded_commits.dedup();
-
-        // Use optimized revision walker with performance settings
-        let walk = self
-            .repository
-            .rev_walk(commit_wants)
-            .with_hidden(excluded_commits)
-            .sorting(gix::revision::walk::Sorting::ByCommitTime(
-                gix_traverse::commit::simple::CommitTimeOrder::NewestFirst,
-            )) // More efficient for recent commits
-            .all()?;
-        let revwalk_setup_duration = revwalk_setup_start.elapsed();
-        eprintln!(
-            "Enumeration timing: Revision walk setup took {:?}",
-            revwalk_setup_duration
-        );
-
-        let mut update_counter = 0;
-        const UPDATE_INTERVAL: usize = 10000; // Reduce progress update frequency for better performance
-
-        // Walk commits and collect all reachable objects with aggressive optimizations
-        let revwalk_start = std::time::Instant::now();
-        let mut commit_batch = Vec::with_capacity(500); // Larger batches for better performance
-        let mut tree_cache = std::collections::HashMap::new(); // Cache tree traversals
-
-        for commit_info in walk {
-            let commit_info = commit_info.map_err(|e| Error::custom(format!("Revision walk failed: {}", e)))?;
-            commit_batch.push(commit_info.id);
-
-            // Process commits in larger batches for better cache locality
-            if commit_batch.len() >= 500 {
-                self.process_commit_batch_cached(&commit_batch, &mut objects, &mut tree_cache)?;
-                commit_batch.clear();
-
-                // Update progress much less frequently
-                update_counter += 500;
-                if update_counter % UPDATE_INTERVAL == 0 {
-                    progress_reporter.update(objects.len())?;
-                }
-            }
-        }
-
-        // Process remaining commits
-        if !commit_batch.is_empty() {
-            self.process_commit_batch_cached(&commit_batch, &mut objects, &mut tree_cache)?;
-        }
-
-        let revwalk_duration = revwalk_start.elapsed();
-        eprintln!("Enumeration timing: Revision walk took {:?}", revwalk_duration);
-
-        progress_reporter.set_current(objects.len());
-        progress_reporter.finish()?;
-
-        // Apply filters if needed
-        let filter_start = std::time::Instant::now();
-        let mut filtered_objects: Vec<_> = objects.into_iter().collect();
-
-        // Apply object filter if specified
-        if let Some(filter) = &session.capabilities.filter {
-            filtered_objects = self.apply_object_filter(filtered_objects, filter.as_ref())?;
-        }
-        let filter_duration = filter_start.elapsed();
-        eprintln!("Enumeration timing: Object filtering took {:?}", filter_duration);
-
-        let enumerate_total_duration = enumerate_start.elapsed();
-        eprintln!(
-            "Enumeration timing: Total enumeration took {:?}",
-            enumerate_total_duration
-        );
-
-        Ok(filtered_objects)
-    }
-
-    /// DEPRECATED: Use gix-pack's count::objects for intelligent object analysis with progress reporting
-    /// This method is now replaced by count_objects_with_expansion
-    #[allow(dead_code)]
-    fn count_objects<W: Write>(
-        &self,
-        object_ids: Vec<gix_hash::ObjectId>,
-        writer: &mut W,
-        session: &SessionContext,
-    ) -> Result<(Vec<output::Count>, output::count::objects::Outcome)> {
-        let count_start = std::time::Instant::now();
-
-        // Set up sideband progress reporting
-        let formatter_start = std::time::Instant::now();
-        let mut formatter = ResponseFormatter::new_with_progress_control(
-            writer,
-            session.capabilities.side_band,
-            session.capabilities.no_progress,
-        );
-        let mut progress_reporter =
-            ProgressReporter::new(&mut formatter, "Counting objects".to_string(), Some(object_ids.len()));
-        let formatter_duration = formatter_start.elapsed();
-        eprintln!("Count objects timing: Formatter setup took {:?}", formatter_duration);
-
-        // Start the gix-pack counting with optimized adapter and Git-native configuration
-        let adapter_start = std::time::Instant::now();
-        let find_adapter = self.create_optimized_find_adapter();
-        let objects_iter = object_ids
-            .into_iter()
-            .map(|id| Ok::<_, Box<dyn std::error::Error + Send + Sync + 'static>>(id));
-        let adapter_duration = adapter_start.elapsed();
-        eprintln!(
-            "Count objects timing: Find adapter creation took {:?}",
-            adapter_duration
-        );
-
-        // Use Git-native pack configuration for optimal compatibility
-        let config_start = std::time::Instant::now();
-        let pack_config = self.get_pack_config();
-        let config_duration = config_start.elapsed();
-        eprintln!("Count objects timing: Pack config retrieval took {:?}", config_duration);
-
-        let counting_start = std::time::Instant::now();
-        let (counts, stats) = output::count::objects(
-            find_adapter,
-            Box::new(objects_iter),
-            &progress::Discard,
-            &AtomicBool::new(false),
-            output::count::objects::Options {
-                input_object_expansion: output::count::objects::ObjectExpansion::TreeContents,
-                thread_limit: Some(pack_config.threads.min(8)), // Limit threads to avoid overhead
-                chunk_size: pack_config.window.max(50),         // Larger chunks for better efficiency
-                ..Default::default()
-            },
-        )
-        .map_err(|e| Error::Pack(format!("Object counting failed: {}", e)))?;
-        let counting_duration = counting_start.elapsed();
-        eprintln!("Count objects timing: Actual counting took {:?}", counting_duration);
-
-        let _actual_count = counts.iter().fold(ObjectCount::default(), |mut c, _e| {
-            c.add(gix_pack::data::output::entry::Kind::Base(gix_object::Kind::Blob));
-            let _ = progress_reporter.update(c.total());
-
-            c
-        });
-
-        // Send final completion message (Git-style)
-        progress_reporter.finish()?;
-
-        // Report final completion
-        let count_total_duration = count_start.elapsed();
-        eprintln!(
-            "Count objects timing: Total counting took {:?} - {} total objects",
-            count_total_duration, stats.total_objects
-        );
-
-        Ok((counts, stats))
-    }
-
     /// Stream pack data using gix-pack's FromEntriesIter
     fn stream_pack_data<W: Write>(
         &self,
@@ -668,22 +383,8 @@ impl<'a> PackGenerator<'a> {
         total_objects: usize,
         session: &SessionContext,
     ) -> Result<PackGenerationStats> {
-        let adapter_start = std::time::Instant::now();
         let find_adapter = self.create_optimized_find_adapter();
-        let adapter_duration = adapter_start.elapsed();
-        eprintln!(
-            "Pack streaming timing: Find adapter creation took {:?}",
-            adapter_duration
-        );
-
-        // Use Git-native pack configuration for entry generation
-        let config_start = std::time::Instant::now();
         let pack_config = self.get_pack_config();
-        let config_duration = config_start.elapsed();
-        eprintln!(
-            "Pack streaming timing: Pack config retrieval took {:?}",
-            config_duration
-        );
 
         let entries_iter_start = std::time::Instant::now();
         let mut entries_iter = output::entry::iter_from_counts(
@@ -837,135 +538,6 @@ impl<'a> PackGenerator<'a> {
             compression_ratio: 1.0,
             generation_time_ms: 0,
         })
-    }
-
-    // Helper methods (similar to our existing implementation)
-
-    /// Process a batch of commits with tree caching for maximum performance
-    fn process_commit_batch_cached(
-        &self,
-        commit_ids: &[gix_hash::ObjectId],
-        objects: &mut HashSet<gix_hash::ObjectId>,
-        tree_cache: &mut std::collections::HashMap<gix_hash::ObjectId, Vec<gix_hash::ObjectId>>,
-    ) -> Result<()> {
-        // Reuse buffer across all commits in the batch
-        let mut buf = self.repository.empty_reusable_buffer();
-
-        for &commit_id in commit_ids {
-            // Add the commit itself
-            objects.insert(commit_id);
-
-            // Get the commit object efficiently with shared buffer
-            let commit = self
-                .repository
-                .find_commit(commit_id)
-                .map_err(|e| Error::custom(format!("Failed to find commit: {}", e)))?;
-
-            // Add the tree and all its contents with caching
-            let tree_id = commit
-                .tree_id()
-                .map_err(|e| Error::custom(format!("Failed to get tree ID: {}", e)))?
-                .detach();
-
-            // Check cache first
-            if let Some(cached_objects) = tree_cache.get(&tree_id) {
-                // Use cached tree traversal result
-                for &obj_id in cached_objects {
-                    objects.insert(obj_id);
-                }
-            } else {
-                // Traverse tree and cache the result
-                let initial_size = objects.len();
-                self.traverse_tree_optimized(tree_id, objects, &mut buf)?;
-
-                // Cache the newly discovered objects for this tree
-                let new_objects: Vec<_> = objects.iter().skip(initial_size).copied().collect();
-                tree_cache.insert(tree_id, new_objects);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Traverse a tree and collect all reachable objects using optimized gix-traverse
-    fn traverse_tree(&self, tree_id: gix_hash::ObjectId, objects: &mut HashSet<gix_hash::ObjectId>) -> Result<()> {
-        let mut buf = self.repository.empty_reusable_buffer();
-        self.traverse_tree_optimized(tree_id, objects, &mut buf)
-    }
-
-    /// Optimized tree traversal with buffer reuse and early termination
-    fn traverse_tree_optimized(
-        &self,
-        tree_id: gix_hash::ObjectId,
-        objects: &mut HashSet<gix_hash::ObjectId>,
-        buf: &mut Vec<u8>,
-    ) -> Result<()> {
-        // Skip if we've already processed this tree (common in Git histories)
-        if !objects.insert(tree_id) {
-            return Ok(()); // Already processed - this is a major optimization for Git repos with shared trees
-        }
-
-        // Get the raw tree data for gix-traverse with provided buffer
-        buf.clear(); // Reuse the buffer
-        let tree_data = {
-            use gix_object::Find;
-            self.repository
-                .try_find(&tree_id, buf)
-                .map_err(|e| Error::custom(format!("Failed to find tree: {}", e)))?
-                .ok_or_else(|| Error::custom("Tree not found".to_string()))?
-        };
-
-        if tree_data.kind != gix_object::Kind::Tree {
-            return Err(Error::custom("Object is not a tree".to_string()));
-        }
-
-        let tree_iter = gix_object::TreeRefIter::from_bytes(tree_data.data);
-
-        // Use optimized traversal with pre-allocated recorder
-        let mut recorder = gix_traverse::tree::Recorder::default();
-
-        // Use repository's optimized traversal with shared buffer management
-        gix_traverse::tree::breadthfirst(
-            tree_iter,
-            gix_traverse::tree::breadthfirst::State::default(),
-            self.repository, // Repository implements Find trait efficiently
-            &mut recorder,
-        )
-        .map_err(|e| Error::custom(format!("Tree traversal failed: {}", e)))?;
-
-        // Add all discovered objects to our set efficiently
-        objects.reserve(recorder.records.len()); // Pre-allocate space
-        for record in recorder.records {
-            objects.insert(record.oid.into());
-        }
-
-        Ok(())
-    }
-
-    fn apply_object_filter(&self, objects: Vec<gix_hash::ObjectId>, filter: &BStr) -> Result<Vec<gix_hash::ObjectId>> {
-        // Optimized filter implementation using efficient object header queries
-        let filter_str = filter.to_str_lossy();
-
-        if filter_str.starts_with("blob:none") {
-            // Filter out all blobs using efficient header-only queries with batching
-            let mut filtered = Vec::with_capacity(objects.len() / 2); // Estimate fewer objects after filtering
-            let mut buf = self.repository.empty_reusable_buffer(); // Reuse buffer
-
-            for oid in objects {
-                // Use header query instead of full object loading for efficiency
-                use gix_object::FindHeader;
-                match self.repository.try_header(&oid) {
-                    Ok(Some(header)) if header.kind != gix_object::Kind::Blob => {
-                        filtered.push(oid);
-                    }
-                    _ => {} // Skip blobs and objects we can't read
-                }
-            }
-            Ok(filtered)
-        } else {
-            // Return all objects for unsupported filters
-            Ok(objects)
-        }
     }
 
     /// Filter out objects that the client already has
