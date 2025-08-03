@@ -184,15 +184,12 @@ impl<'a> HandshakeManager<'a> {
         }
     }
     
-    /// Get the peeled target of an annotated tag
+    /// Get the peeled target of an annotated tag - optimized with type-specific access
     fn get_peeled_tag_target(&self, tag_oid: gix_hash::ObjectId) -> Result<Option<gix_hash::ObjectId>> {
-        if let Ok(obj) = self.repository.find_object(tag_oid) {
-            if obj.kind == gix::object::Kind::Tag {
-                if let Ok(tag) = obj.try_into_tag() {
-                    if let Ok(target) = tag.target_id() {
-                        return Ok(Some(target.detach()));
-                    }
-                }
+        // Use type-specific method for better performance
+        if let Ok(tag) = self.repository.find_tag(tag_oid) {
+            if let Ok(target) = tag.target_id() {
+                return Ok(Some(target.detach()));
             }
         }
         Ok(None)

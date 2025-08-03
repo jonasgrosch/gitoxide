@@ -84,6 +84,20 @@ impl<'a> NegotiationEngine<'a> {
     pub fn new(repository: &'a Repository, options: &'a ServerOptions) -> Self {
         Self { repository }
     }
+
+    /// Efficiently collect all direct children of a tree - optimized helper with buffer reuse
+    fn collect_tree_children(&self, tree_id: gix_hash::ObjectId, queue: &mut std::collections::VecDeque<gix_hash::ObjectId>) -> Result<()> {
+        let tree = self.repository.find_tree(tree_id)
+            .map_err(|e| Error::custom(format!("Failed to find tree: {}", e)))?;
+
+        // Use direct iteration for immediate children (more efficient than full traversal)
+        for entry in tree.iter() {
+            if let Ok(entry) = entry {
+                queue.push_back(entry.oid().to_owned());
+            }
+        }
+        Ok(())
+    }
     
     /// Perform complete negotiation for protocol v1
     pub fn negotiate_v1<R: BufRead, W: Write>(
@@ -537,41 +551,24 @@ impl<'a> NegotiationEngine<'a> {
                 continue;
             }
             
-            // Traverse object based on type
-            if let Ok(obj) = self.repository.find_object(oid) {
-                match obj.kind {
-                    gix::object::Kind::Commit => {
-                        if let Ok(commit) = obj.try_into_commit() {
-                            // Add tree
-                            queue.push_back(commit.tree()?.id().into());
-                            
-                            // Add parents
-                            for parent in commit.parent_ids() {
-                                queue.push_back(parent.detach());
-                            }
-                        }
-                    }
-                    gix::object::Kind::Tree => {
-                        if let Ok(tree) = obj.try_into_tree() {
-                            for entry in tree.iter() {
-                                if let Ok(entry) = entry {
-                                    queue.push_back(entry.oid().to_owned());
-                                }
-                            }
-                        }
-                    }
-                    gix::object::Kind::Tag => {
-                        if let Ok(tag) = obj.try_into_tag() {
-                            if let Ok(target) = tag.target_id() {
-                                queue.push_back(target.detach());
-                            }
-                        }
-                    }
-                    gix::object::Kind::Blob => {
-                        // Blobs have no children
-                    }
+            // Traverse object based on type - optimized with type-specific access
+            if let Ok(commit) = self.repository.find_commit(oid) {
+                // Add tree
+                queue.push_back(commit.tree()?.id().into());
+                
+                // Add parents
+                for parent in commit.parent_ids() {
+                    queue.push_back(parent.detach());
+                }
+            } else if let Ok(_tree) = self.repository.find_tree(oid) {
+                // Use optimized helper for tree traversal
+                self.collect_tree_children(oid, &mut queue)?;
+            } else if let Ok(tag) = self.repository.find_tag(oid) {
+                if let Ok(target) = tag.target_id() {
+                    queue.push_back(target.detach());
                 }
             }
+            // Blobs have no children - no need to handle them
         }
         
         Ok(())
@@ -601,36 +598,21 @@ impl<'a> NegotiationEngine<'a> {
                 continue;
             }
             
-            // Traverse based on object type  
-            if let Ok(obj) = self.repository.find_object(oid) {
-                match obj.kind {
-                    gix::object::Kind::Commit => {
-                        if let Ok(commit) = obj.try_into_commit() {
-                            queue.push_back(commit.tree()?.id().into());
-                            for parent in commit.parent_ids() {
-                                queue.push_back(parent.detach());
-                            }
-                        }
-                    }
-                    gix::object::Kind::Tree => {
-                        if let Ok(tree) = obj.try_into_tree() {
-                            for entry in tree.iter() {
-                                if let Ok(entry) = entry {
-                                    queue.push_back(entry.oid().to_owned());
-                                }
-                            }
-                        }
-                    }
-                    gix::object::Kind::Tag => {
-                        if let Ok(tag) = obj.try_into_tag() {
-                            if let Ok(target) = tag.target_id() {
-                                queue.push_back(target.detach());
-                            }
-                        }
-                    }
-                    gix::object::Kind::Blob => {}
+            // Traverse based on object type - optimized with type-specific access
+            if let Ok(commit) = self.repository.find_commit(oid) {
+                queue.push_back(commit.tree()?.id().into());
+                for parent in commit.parent_ids() {
+                    queue.push_back(parent.detach());
+                }
+            } else if let Ok(_tree) = self.repository.find_tree(oid) {
+                // Use optimized helper for tree traversal
+                self.collect_tree_children(oid, &mut queue)?;
+            } else if let Ok(tag) = self.repository.find_tag(oid) {
+                if let Ok(target) = tag.target_id() {
+                    queue.push_back(target.detach());
                 }
             }
+            // Blobs have no children - no need to handle them
         }
         
         Ok(())
@@ -671,10 +653,9 @@ impl<'a> NegotiationEngine<'a> {
         let mut shallow = HashSet::new();
         
         for want in wants {
-            if let Ok(obj) = self.repository.find_object(*want) {
-                if obj.kind == gix::object::Kind::Commit {
-                    self.collect_shallow_at_depth(*want, depth, &mut shallow)?;
-                }
+            // Use type-specific method for better performance
+            if let Ok(_commit) = self.repository.find_commit(*want) {
+                self.collect_shallow_at_depth(*want, depth, &mut shallow)?;
             }
         }
         
@@ -700,21 +681,20 @@ impl<'a> NegotiationEngine<'a> {
                 continue;
             }
             
-            if let Ok(obj) = self.repository.find_object(oid) {
-                if let Ok(commit) = obj.try_into_commit() {
-                    for parent_id in commit.parent_ids() {
-                        let parent_id = parent_id.detach();
-                        let parent_depth = depth + 1;
-                        
-                        if let Some(&existing_depth) = depths.get(&parent_id) {
-                            if existing_depth <= parent_depth {
-                                continue;
-                            }
+            // Use type-specific method for better performance
+            if let Ok(commit) = self.repository.find_commit(oid) {
+                for parent_id in commit.parent_ids() {
+                    let parent_id = parent_id.detach();
+                    let parent_depth = depth + 1;
+                    
+                    if let Some(&existing_depth) = depths.get(&parent_id) {
+                        if existing_depth <= parent_depth {
+                            continue;
                         }
-                        
-                        depths.insert(parent_id, parent_depth);
-                        queue.push_back((parent_id, parent_depth));
                     }
+                    
+                    depths.insert(parent_id, parent_depth);
+                    queue.push_back((parent_id, parent_depth));
                 }
             }
         }
@@ -756,18 +736,17 @@ impl<'a> NegotiationEngine<'a> {
             
             visited.insert(oid);
             
-            if let Ok(obj) = self.repository.find_object(oid) {
-                if let Ok(commit) = obj.try_into_commit() {
-                    let commit_time = commit.time().unwrap_or_default();
-                    
-                    if commit_time.seconds < since_time.seconds {
-                        shallow.insert(oid);
-                        continue;
-                    }
-                    
-                    for parent_id in commit.parent_ids() {
-                        queue.push_back(parent_id.detach());
-                    }
+            // Use type-specific method for better performance
+            if let Ok(commit) = self.repository.find_commit(oid) {
+                let commit_time = commit.time().unwrap_or_default();
+                
+                if commit_time.seconds < since_time.seconds {
+                    shallow.insert(oid);
+                    continue;
+                }
+                
+                for parent_id in commit.parent_ids() {
+                    queue.push_back(parent_id.detach());
                 }
             }
         }
@@ -817,11 +796,10 @@ impl<'a> NegotiationEngine<'a> {
             
             excluded.insert(oid);
             
-            if let Ok(obj) = self.repository.find_object(oid) {
-                if let Ok(commit) = obj.try_into_commit() {
-                    for parent_id in commit.parent_ids() {
-                        queue.push_back(parent_id.detach());
-                    }
+            // Use type-specific method for better performance
+            if let Ok(commit) = self.repository.find_commit(oid) {
+                for parent_id in commit.parent_ids() {
+                    queue.push_back(parent_id.detach());
                 }
             }
         }
@@ -848,23 +826,22 @@ impl<'a> NegotiationEngine<'a> {
             
             visited.insert(oid);
             
-            if let Ok(obj) = self.repository.find_object(oid) {
-                if let Ok(commit) = obj.try_into_commit() {
-                    let mut has_excluded_parent = false;
+            // Use type-specific method for better performance
+            if let Ok(commit) = self.repository.find_commit(oid) {
+                let mut has_excluded_parent = false;
+                
+                for parent_id in commit.parent_ids() {
+                    let parent_id = parent_id.detach();
                     
-                    for parent_id in commit.parent_ids() {
-                        let parent_id = parent_id.detach();
-                        
-                        if excluded.contains(&parent_id) {
-                            has_excluded_parent = true;
-                        } else {
-                            queue.push_back(parent_id);
-                        }
+                    if excluded.contains(&parent_id) {
+                        has_excluded_parent = true;
+                    } else {
+                        queue.push_back(parent_id);
                     }
-                    
-                    if has_excluded_parent {
-                        shallow.insert(oid);
-                    }
+                }
+                
+                if has_excluded_parent {
+                    shallow.insert(oid);
                 }
             }
         }

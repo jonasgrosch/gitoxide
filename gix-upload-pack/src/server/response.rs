@@ -349,6 +349,10 @@ impl<'a, W: std::io::Write> ProgressReporter<'a, W> {
         }
     }
     
+    pub fn set_current(&mut self, current: usize) {
+        self.current = current;
+    }
+    
     /// Update progress (Git-style: only report on percentage changes)
     pub fn update(&mut self, current: usize) -> Result<()> {
         self.current = current;

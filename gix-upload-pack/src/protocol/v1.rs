@@ -115,21 +115,13 @@ impl<'a> Handler<'a> {
                 gix::refs::TargetRef::Object(oid) => {
                     let target = oid.to_owned();
                     
-                    // Check if this is an annotated tag and get peeled value
+                    // Check if this is an annotated tag and get peeled value - optimized
                     let peeled = if name.starts_with_str("refs/tags/") {
-                        if let Ok(obj) = self.repository.find_object(target) {
-                            if obj.kind == gix::object::Kind::Tag {
-                                // Get the peeled target of the tag
-                                obj.try_into_tag()
-                                    .ok()
-                                    .and_then(|tag| tag.target_id().ok())
-                                    .map(|id| id.detach())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
+                        // Use type-specific method for better performance
+                        self.repository.find_tag(target)
+                            .ok()
+                            .and_then(|tag| tag.target_id().ok())
+                            .map(|id| id.detach())
                     } else {
                         None
                     };
