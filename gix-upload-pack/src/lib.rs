@@ -42,6 +42,7 @@
 
 pub mod error;
 pub mod server;
+pub mod services;
 pub mod config;
 pub mod protocol;
 mod types;

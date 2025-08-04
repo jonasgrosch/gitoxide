@@ -1,0 +1,18 @@
+# Clippy configuration for gix-upload-pack
+# Enforces idiomatic Rust patterns and best practices
+
+# Enforce documentation for public items
+missing-docs-in-crate-items = false
+
+# Enforce consistent naming
+enum-variant-name-threshold = 3
+
+# Enforce argument parsing best practices
+# These are specific to clap derive patterns
+too-many-arguments-threshold = 8  # Allow up to 8 arguments for CLI tools
+max-struct-bools = 5  # Allow up to 5 boolean flags
+
+# Allow certain patterns common in CLI applications
+# These are reasonable for argument parsing code
+cognitive-complexity-threshold = 30
+type-complexity-threshold = 250

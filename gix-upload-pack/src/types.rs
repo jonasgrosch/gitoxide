@@ -5,6 +5,18 @@ use gix_hash::ObjectId;
 use smallvec::SmallVec;
 use std::collections::HashSet;
 
+/// Protocol message constants
+pub mod protocol {
+    /// Common protocol messages
+    pub const NAK: &[u8] = b"NAK\n";
+
+    
+    /// ACK message prefixes
+    pub const ACK_PREFIX: &str = "ACK ";
+    pub const ACK_CONTINUE_SUFFIX: &str = " continue";
+    pub const ACK_READY_SUFFIX: &str = " ready";
+}
+
 // Re-export transport types
 pub use gix_transport::client::Capabilities;
 pub use gix_transport::Protocol as ProtocolVersion;
@@ -61,7 +73,7 @@ impl SideBandMode {
         match self {
             SideBandMode::None => None,
             SideBandMode::Basic => Some(999),      // 1000 - 1 byte for channel
-            SideBandMode::SideBand64k => Some(65519), // 65520 - 1 byte for channel
+            SideBandMode::SideBand64k => Some(65515), // gix-packetline limit with safety margin
         }
     }
 
@@ -161,7 +173,7 @@ impl Default for ServerCapabilities {
             deepen_since: true,
             deepen_not: true,
             deepen_relative: true,
-            no_progress: false,
+            no_progress: true,
             filter: false,
             allow_tip_sha1_in_want: false,
             allow_reachable_sha1_in_want: false,
@@ -392,7 +404,7 @@ mod tests {
     fn test_sideband_mode_max_data_size() {
         assert_eq!(SideBandMode::None.max_data_size(), None);
         assert_eq!(SideBandMode::Basic.max_data_size(), Some(999));
-        assert_eq!(SideBandMode::SideBand64k.max_data_size(), Some(65519));
+        assert_eq!(SideBandMode::SideBand64k.max_data_size(), Some(65515));
     }
 
     #[test]

@@ -7,12 +7,13 @@ use crate::{
     config::ServerOptions,
     error::{Error, Result},
     protocol::ProtocolHandler,
-    server::{capabilities::CapabilityManager, pack_generation},
+    services::{CapabilityManager, pack::PackGenerator, {packet_io::{EnhancedPacketReader, EnhancedPacketWriter}}},
     types::*,
 };
 use bstr::ByteSlice;
 use gix::Repository;
 use gix_pack::Find;
+
 use gix_packetline::{PacketLineRef, StreamingPeekableIter};
 use std::{
     collections::HashMap,
@@ -21,225 +22,86 @@ use std::{
 
 // Async support removed - now fully synchronous
 
-/// Protocol V2 handler
+/// Protocol V2 handler with dependency injection
 pub struct Handler<'a> {
     repository: &'a Repository,
     options: &'a ServerOptions,
-    capability_manager: CapabilityManager<'a>,
+    capability_manager: &'a CapabilityManager<'a>,
+    command_parser: &'a crate::services::CommandParser<'a>,
+    reference_manager: &'a crate::services::ReferenceManager<'a>,
+    pack_generator: &'a PackGenerator<'a>,
+    packet_io_factory: &'a crate::services::PacketIOFactory,
 }
 
 impl<'a> Handler<'a> {
-    /// Create a new V2 protocol handler
-    pub fn new(repository: &'a Repository, options: &'a ServerOptions) -> Self {
+    /// Create a new V2 protocol handler with dependency injection
+    pub fn new(
+        repository: &'a Repository,
+        options: &'a ServerOptions,
+        capability_manager: &'a CapabilityManager<'a>,
+        command_parser: &'a crate::services::CommandParser<'a>,
+        reference_manager: &'a crate::services::ReferenceManager<'a>,
+        pack_generator: &'a PackGenerator<'a>,
+        packet_io_factory: &'a crate::services::PacketIOFactory,
+    ) -> Self {
         Self {
             repository,
             options,
-            capability_manager: CapabilityManager::new(repository, options),
+            capability_manager,
+            command_parser,
+            reference_manager,
+            pack_generator,
+            packet_io_factory,
         }
     }
 
-    /// Send capability advertisement using gix-protocol integration
+    /// Send capability advertisement using streamlined approach
     fn advertise_capabilities<W: Write>(&self, writer: &mut W) -> Result<()> {
-        // Build capabilities using the integrated capability manager
-        let server_caps = self.capability_manager.build_server_capabilities(ProtocolVersion::V2)?;
+        // Use injected packet I/O factory
+        let mut packet_writer = self.packet_io_factory.create_temp_writer(writer);
+        
+        // Get capability lines from capability manager (no direct writing)
+        let capability_lines = self.capability_manager.get_v2_capability_lines(&self.options.capabilities);
 
-        // Send capabilities directly - they're already in the right format from gix-protocol
-        // Write each capability line
-        for capability in server_caps.iter() {
-            let cap_line = format!("{}\n", capability.name().to_str_lossy());
-            gix_packetline::encode::data_to_write(cap_line.as_bytes(), &mut *writer)?;
+        // Send capability lines through packet writer
+        for line in capability_lines {
+            packet_writer.write_protocol_message(format!("{}\n", line).as_bytes())?;
         }
 
         // End capabilities with flush
-        gix_packetline::PacketLineRef::Flush.write_to(&mut *writer)?;
+        packet_writer.write_flush()?;
 
         Ok(())
     }
 
-    /// Collect references for V2 protocol
-    fn collect_refs_v2(&self, prefixes: &[String]) -> Result<Vec<Reference>> {
-        let mut refs = Vec::new();
-
-        // In V2, we should include HEAD as a regular reference
-        if let Ok(head) = self.repository.head() {
-            match head.kind {
-                gix::head::Kind::Symbolic(target_ref) => {
-                    // Add HEAD as a reference pointing to the same commit as the target
-                    if let gix::refs::Target::Object(oid) = &target_ref.target {
-                        refs.push(ProtocolRef::Symbolic {
-                            full_ref_name: "HEAD".into(),
-                            target: target_ref.name.as_bstr().to_owned(),
-                            tag: None,
-                            object: *oid,
-                        });
-                    }
-                }
-                gix::head::Kind::Detached { target, .. } => {
-                    // Detached HEAD
-                    refs.push(ProtocolRef::Direct {
-                        full_ref_name: "HEAD".into(),
-                        object: target,
-                    });
-                }
-                gix::head::Kind::Unborn(_) => {
-                    // Skip unborn HEAD in V2
-                }
-            }
-        }
-
-        // Get the reference iterator
-        let refs_binding = self.repository.references().map_err(|e| Error::RefPackedBuffer(e))?;
-
-        let mut all_refs = Vec::new();
-        let all_refs_iter = refs_binding.all().map_err(|e| Error::RefIterInit(e))?;
-
-        for reference in all_refs_iter {
-            if let Ok(reference) = reference {
-                let ref_name = reference.name().as_bstr().to_str_lossy();
-                for prefix in prefixes {
-                    if ref_name.starts_with(prefix) {
-                        all_refs.push(reference);
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Process the collected refs
-        for reference in all_refs {
-            let name = reference.name().as_bstr();
-
-            // Check if reference should be hidden
-            if self.options.is_ref_hidden(name.to_str_lossy().as_ref()) {
-                continue;
-            }
-
-            match reference.target() {
-                gix::refs::TargetRef::Symbolic(target_ref_name) => {
-                    // We need to fetch the target object id for symbolic refs
-                    let object: Option<std::result::Result<gix::Reference<'_>, gix_ref::file::find::existing::Error>> =
-                        reference.follow();
-
-                    if let Some(Ok(resolved_ref)) = object {
-                        refs.push(ProtocolRef::Symbolic {
-                            full_ref_name: name.to_owned(),
-                            target: target_ref_name.as_bstr().to_owned(),
-                            tag: None,
-                            object: resolved_ref.target().id().to_owned(),
-                        });
-                    }
-                }
-                gix::refs::TargetRef::Object(oid) => {
-                    let target = oid.to_owned();
-                    let name = name.to_owned();
-
-                    // Get peeled value for tags - optimized
-                    let peeled = if name.starts_with_str("refs/tags/") {
-                        // Use type-specific method for better performance
-                        self.repository
-                            .find_tag(target)
-                            .ok()
-                            .and_then(|tag| tag.target_id().ok())
-                            .map(|id| id.detach())
-                    } else {
-                        None
-                    };
-
-                    if let Some(peeled) = peeled {
-                        refs.push(ProtocolRef::Peeled {
-                            full_ref_name: name,
-                            tag: target,
-                            object: peeled,
-                        });
-                    } else {
-                        refs.push(ProtocolRef::Direct {
-                            full_ref_name: name,
-                            object: target,
-                        });
-                    }
-                }
-            }
-        }
-
-        Ok(refs)
-    }
-
-    /// Parse want line for V2
-    fn parse_want_line_v2(&self, line: &[u8], session: &mut SessionContext) -> Result<()> {
-        let oid_str =
-            std::str::from_utf8(line.trim_ascii()).map_err(|_| Error::custom("Invalid UTF-8 in want line"))?;
-
-        let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes()).map_err(|_| Error::InvalidObjectId {
-            oid: oid_str.to_string(),
-        })?;
-
-        session.negotiation.wants.insert(oid);
+    /// Advertise protocol v2 capabilities and commands (equivalent to --advertise-refs for v2)
+    fn advertise_refs<W: Write>(&self, writer: &mut EnhancedPacketWriter<W>) -> Result<()> {
+        // For advertise-refs mode, use the exact format that native git uses
+        // This is simpler than the full capability negotiation format
+        
+        // Version line
+        writer.write_protocol_message(b"version 2\n")?;
+        
+        // Agent capability
+        let agent = format!("agent=git/gitoxide-{}\n", crate::VERSION);
+        writer.write_protocol_message(agent.as_bytes())?;
+        
+        // Commands in the exact order that native git uses
+        writer.write_protocol_message(b"ls-refs=unborn\n")?;
+        writer.write_protocol_message(b"fetch=shallow wait-for-done\n")?;
+        writer.write_protocol_message(b"server-option\n")?;
+        writer.write_protocol_message(b"object-format=sha1\n")?;
+        writer.write_protocol_message(b"object-info\n")?;
+        
+        // End with flush packet
+        writer.write_flush()?;
+        
         Ok(())
     }
 
-    /// Parse have line for V2
-    fn parse_have_line_v2(&self, line: &[u8], session: &mut SessionContext) -> Result<()> {
-        let oid_str =
-            std::str::from_utf8(line.trim_ascii()).map_err(|_| Error::custom("Invalid UTF-8 in have line"))?;
 
-        let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes()).map_err(|_| Error::InvalidObjectId {
-            oid: oid_str.to_string(),
-        })?;
 
-        session.negotiation.haves.insert(oid);
-        Ok(())
-    }
 
-    /// Parse shallow line for V2
-    fn parse_shallow_line_v2(&self, line: &[u8], session: &mut SessionContext) -> Result<()> {
-        let oid_str =
-            std::str::from_utf8(line.trim_ascii()).map_err(|_| Error::custom("Invalid UTF-8 in shallow line"))?;
-
-        let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes()).map_err(|_| Error::InvalidObjectId {
-            oid: oid_str.to_string(),
-        })?;
-
-        session.negotiation.shallow.insert(oid);
-        Ok(())
-    }
-
-    /// Parse deepen line for V2
-    fn parse_deepen_line_v2(&self, line: &[u8], session: &mut SessionContext) -> Result<()> {
-        let depth_str =
-            std::str::from_utf8(line.trim_ascii()).map_err(|_| Error::custom("Invalid UTF-8 in deepen line"))?;
-
-        let depth: u32 = depth_str.parse().map_err(|_| Error::custom("Invalid depth value"))?;
-
-        session.negotiation.deepen = Some(DeepenSpec::Depth(depth));
-        Ok(())
-    }
-
-    /// Parse deepen-since line for V2
-    fn parse_deepen_since_line_v2(&self, line: &[u8], session: &mut SessionContext) -> Result<()> {
-        let timestamp_str =
-            std::str::from_utf8(line.trim_ascii()).map_err(|_| Error::custom("Invalid UTF-8 in deepen-since line"))?;
-
-        let timestamp: i64 = timestamp_str
-            .parse()
-            .map_err(|_| Error::custom("Invalid timestamp value"))?;
-
-        let time = gix_date::Time::new(timestamp, 0);
-        session.negotiation.deepen = Some(DeepenSpec::Since(time));
-        Ok(())
-    }
-
-    /// Parse deepen-not line for V2
-    fn parse_deepen_not_line_v2(&self, line: &[u8], session: &mut SessionContext) -> Result<()> {
-        let ref_str =
-            std::str::from_utf8(line.trim_ascii()).map_err(|_| Error::custom("Invalid UTF-8 in deepen-not line"))?;
-
-        if let Some(DeepenSpec::Not(ref mut refs)) = session.negotiation.deepen {
-            refs.push(ref_str.into());
-        } else {
-            session.negotiation.deepen = Some(DeepenSpec::Not(vec![ref_str.into()]));
-        }
-        Ok(())
-    }
 
     /// Parse command arguments for V2
     fn parse_command_arguments_v2<R: BufRead>(
@@ -349,7 +211,7 @@ impl<'a> Handler<'a> {
         // Parse arguments
         let symrefs = args.get("symrefs").is_some();
         let peel = args.get("peel").is_some();
-        let unborn = args.get("unborn").is_some();
+        let _unborn = args.get("unborn").is_some();
 
         // Collect all ref-prefix arguments (they come as separate keys like "ref-prefix HEAD", "ref-prefix refs/heads/")
         let ref_prefixes: Vec<String> = args
@@ -363,8 +225,8 @@ impl<'a> Handler<'a> {
             })
             .collect();
 
-        // Get references
-        let refs = self.collect_refs_v2(&ref_prefixes)?;
+        // Get references using injected reference manager
+        let refs = self.reference_manager.collect_references_with_prefixes(&ref_prefixes)?;
 
         // Send references
         for reference in refs {
@@ -390,11 +252,15 @@ impl<'a> Handler<'a> {
             }
 
             line.push('\n');
-            gix_packetline::encode::data_to_write(line.as_bytes(), &mut *writer)?;
+            // Use injected packet I/O factory for consistent packet encoding
+            let mut packet_writer = self.packet_io_factory.create_temp_writer(&mut *writer);
+            packet_writer.write_protocol_message(line.as_bytes())?;
         }
 
         // End with flush
-        gix_packetline::PacketLineRef::Flush.write_to(writer)?;
+        // Use injected packet I/O factory for consistent packet encoding
+        let mut packet_writer = self.packet_io_factory.create_temp_writer(writer);
+        packet_writer.write_flush()?;
 
         Ok(())
     }
@@ -403,7 +269,7 @@ impl<'a> Handler<'a> {
     fn handle_fetch<R: BufRead, W: Write>(
         &self,
         reader: &mut StreamingPeekableIter<R>,
-        writer: &mut W,
+        writer: &mut EnhancedPacketWriter<W>,
         args: &HashMap<String, String>,
         session: &mut SessionContext,
     ) -> Result<()> {
@@ -435,6 +301,7 @@ impl<'a> Handler<'a> {
         let thin_pack = args.get("thin-pack").is_some();
         let ofs_delta = args.get("ofs-delta").is_some();
         let include_tag = args.get("include-tag").is_some();
+        let no_progress = args.get("no-progress").is_some();
         let sideband_all = args.get("sideband-all").is_some();
         let _wait_for_done = args.get("wait-for-done").is_some();
 
@@ -445,10 +312,11 @@ impl<'a> Handler<'a> {
         session.capabilities.thin_pack = thin_pack;
         session.capabilities.ofs_delta = ofs_delta;
         session.capabilities.include_tag = include_tag;
+        session.capabilities.no_progress = no_progress;
         session.capabilities.filter = filter;
 
-        // Protocol v2 defaults to side-band support (matches Git behavior)
-        // Client can explicitly request sideband-all, but we enable it by default
+        // Protocol v2 defaults to sideband support (matches Git behavior)
+        // Git always uses sideband in v2 protocol for progress messages
         session.capabilities.side_band = if sideband_all {
             SideBandMode::SideBand64k
         } else {
@@ -460,6 +328,9 @@ impl<'a> Handler<'a> {
             "Debug: Set session.capabilities.side_band to {:?} (sideband_all: {})",
             session.capabilities.side_band, sideband_all
         );
+
+        // Update writer's sideband mode based on negotiated capabilities
+        writer.set_sideband_mode(session.capabilities.side_band);
 
         // Read fetch parameters
         self.read_fetch_parameters(reader, session)?;
@@ -487,28 +358,34 @@ impl<'a> Handler<'a> {
             // Only send acknowledgments section if we have acknowledgments to send
             if !acks.is_empty() {
                 // Send acknowledgments section
-                gix_packetline::encode::data_to_write(b"acknowledgments\n", &mut *writer)?;
+                // Use injected packet I/O factory for consistent packet encoding
+                let mut packet_writer = self.packet_io_factory.create_temp_writer(&mut *writer);
+                packet_writer.write_protocol_message(b"acknowledgments\n")?;
 
                 for ack in acks {
                     let ack_line = format!("ACK {}\n", ack.to_hex());
-                    gix_packetline::encode::data_to_write(ack_line.as_bytes(), &mut *writer)?;
+                    // Use injected packet I/O factory for consistent packet encoding
+                    let mut packet_writer = self.packet_io_factory.create_temp_writer(&mut *writer);
+                    packet_writer.write_protocol_message(ack_line.as_bytes())?;
                 }
 
                 // End acknowledgments
-                gix_packetline::PacketLineRef::Flush.write_to(&mut *writer)?;
+                // Use injected packet I/O factory for consistent packet encoding
+                let mut packet_writer = self.packet_io_factory.create_temp_writer(&mut *writer);
+                packet_writer.write_flush()?;
             }
 
             // Send packfile section
-            gix_packetline::encode::data_to_write(b"packfile\n", &mut *writer)?;
+            writer.write_protocol_message(b"packfile\n")?;
 
             eprintln!(
                 "Debug: About to generate pack for {} wants",
                 session.negotiation.wants.len()
             );
 
-            // Generate and send pack directly to writer (bypassing formatter for binary data)
-            let pack_generator = pack_generation::PackGenerator::new(self.repository, self.options);
-            let pack_stats = pack_generator.generate_pack(&mut *writer, session)?;
+            // Generate and send pack using EnhancedPacketWriter for proper sideband handling
+            let pack_generator = self.pack_generator;
+            let pack_stats = pack_generator.generate_pack(writer, session)?;
 
             eprintln!("Debug: Pack generation complete - stats: {:?}", pack_stats);
         }
@@ -530,19 +407,26 @@ impl<'a> Handler<'a> {
 
             if let Some(line_data) = line.as_slice() {
                 if let Some(want_line) = line_data.strip_prefix(b"want ") {
-                    self.parse_want_line_v2(want_line, session)?;
+                    // Use centralized command parser
+                    self.command_parser.parse_want_line(want_line, session)?;
                 } else if let Some(have_line) = line_data.strip_prefix(b"have ") {
-                    self.parse_have_line_v2(have_line, session)?;
+                    // Use centralized command parser
+                    let _is_common = self.command_parser.parse_have_line(have_line, session)?;
                 } else if let Some(shallow_line) = line_data.strip_prefix(b"shallow ") {
-                    self.parse_shallow_line_v2(shallow_line, session)?;
+                    // Use centralized command parser
+                    self.command_parser.parse_shallow_line(shallow_line, session)?;
                 } else if let Some(deepen_line) = line_data.strip_prefix(b"deepen ") {
-                    self.parse_deepen_line_v2(deepen_line, session)?;
+                    // Use centralized command parser
+                    self.command_parser.parse_deepen_line(deepen_line, session)?;
                 } else if let Some(deepen_since_line) = line_data.strip_prefix(b"deepen-since ") {
-                    self.parse_deepen_since_line_v2(deepen_since_line, session)?;
+                    // Use centralized command parser
+                    self.command_parser.parse_deepen_since_line(deepen_since_line, session)?;
                 } else if let Some(deepen_not_line) = line_data.strip_prefix(b"deepen-not ") {
-                    self.parse_deepen_not_line_v2(deepen_not_line, session)?;
+                    // Use centralized command parser
+                    self.command_parser.parse_deepen_not_line(deepen_not_line, session)?;
                 } else if line_data.trim_ascii() == b"done" {
-                    session.negotiation.done = true;
+                    // Use centralized command parser
+                    self.command_parser.parse_done_line(session)?;
                     break;
                 }
             }
@@ -550,15 +434,22 @@ impl<'a> Handler<'a> {
 
         Ok(())
     }
-}
 
-impl<'a> ProtocolHandler for Handler<'a> {
-    fn handle_session<R: Read, W: Write>(
+    /// Handle session with injected packet I/O
+    pub fn handle_session_with_io<R: Read, W: Write>(
         &mut self,
-        input: R,
-        mut output: W,
+        reader: EnhancedPacketReader<R>,
+        writer: &mut EnhancedPacketWriter<W>,
         session: &mut SessionContext,
     ) -> Result<()> {
+        // Check if we're in advertise-refs mode
+        if self.options.advertise_refs {
+            // Just advertise capabilities and commands, then exit
+            self.advertise_refs(writer)?;
+            return Ok(());
+        }
+
+        let input = reader.into_inner();
         let mut buffered_input = BufReader::new(input);
         let mut line_reader = gix_packetline::StreamingPeekableIter::new(
             &mut buffered_input,
@@ -569,7 +460,7 @@ impl<'a> ProtocolHandler for Handler<'a> {
         // Protocol V2 only advertises capabilities in non-stateless RPC mode
         // In stateless RPC mode (--stateless-rpc), we wait for client command first
         if !session.stateless_rpc {
-            self.advertise_capabilities(&mut output)?;
+            self.advertise_capabilities(writer.inner_mut())?;
         }
 
         // Wait for command
@@ -603,10 +494,10 @@ impl<'a> ProtocolHandler for Handler<'a> {
         // Handle the command
         match command {
             Some(Command::LsRefs) => {
-                self.handle_ls_refs(&mut line_reader, &mut output, &args)?;
+                self.handle_ls_refs(&mut line_reader, writer.inner_mut(), &args)?;
             }
             Some(Command::Fetch) => {
-                self.handle_fetch(&mut line_reader, &mut output, &args, session)?;
+                self.handle_fetch(&mut line_reader, writer, &args, session)?;
             }
             None => {
                 return Err(Error::custom(format!("Unsupported command: {:?}", command)));
@@ -614,5 +505,30 @@ impl<'a> ProtocolHandler for Handler<'a> {
         }
 
         Ok(())
+    }
+}
+
+impl<'a> ProtocolHandler for Handler<'a> {
+    fn handle_session<R: Read, W: Write>(
+        &mut self,
+        input: R,
+        output: W,
+        session: &mut SessionContext,
+    ) -> Result<()> {
+        // Use injected packet I/O factory
+        let reader = self.packet_io_factory.create_reader(input, false);
+        
+        // For advertise-refs mode, never use sideband (Git protocol requirement)
+        let sideband_mode = if self.options.advertise_refs {
+            crate::types::SideBandMode::None
+        } else {
+            // Start with no sideband - will be updated after capability negotiation
+            crate::types::SideBandMode::None
+        };
+        
+        let mut writer = self.packet_io_factory.create_writer(output, sideband_mode);
+        
+        // Delegate to the method with injected I/O
+        self.handle_session_with_io(reader, &mut writer, session)
     }
 }
