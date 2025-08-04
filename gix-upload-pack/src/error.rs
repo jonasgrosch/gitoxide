@@ -155,10 +155,7 @@ impl Error {
 
     /// Check if this error indicates the client should retry
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Io(_) | Self::Transport(_) | Self::Packetline(_)
-        )
+        matches!(self, Self::Io(_) | Self::Transport(_) | Self::Packetline(_))
     }
 
     /// Check if this error should be reported to the client

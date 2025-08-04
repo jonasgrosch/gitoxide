@@ -7,7 +7,11 @@ use crate::{
     config::ServerOptions,
     error::{Error, Result},
     protocol::ProtocolHandler,
-    services::{CapabilityManager, pack::PackGenerator, {packet_io::{EnhancedPacketReader, EnhancedPacketWriter}}},
+    services::{
+        pack::PackGenerator,
+        packet_io::{EnhancedPacketReader, EnhancedPacketWriter},
+        CapabilityManager,
+    },
     types::*,
 };
 use gix::Repository;
@@ -65,7 +69,7 @@ impl<'a> Handler<'a> {
         let cap_strings = self.capability_manager.get_v1_capability_strings(capabilities);
         let caps_str = cap_strings.join(" ");
         let lines = self.reference_manager.format_v1_advertisement(&refs, &caps_str)?;
-        
+
         for line in lines {
             writer.write_protocol_message(format!("{}\n", line).as_bytes())?;
         }
@@ -74,10 +78,6 @@ impl<'a> Handler<'a> {
         writer.write_flush()?;
         Ok(())
     }
-
-
-
-
 
     /// Handle want/have negotiation phase using EnhancedPacketWriter
     fn handle_negotiation<R: Read, W: Write>(
@@ -115,26 +115,33 @@ impl<'a> Handler<'a> {
                     let line = line_result??;
                     eprintln!("Debug: Packet {}: {:?}", packet_count, line);
                     if EnhancedPacketReader::<R>::is_flush_packet(&line) {
-                        eprintln!("Debug: Received flush packet in collect_wants after {} packets", packet_count);
+                        eprintln!(
+                            "Debug: Received flush packet in collect_wants after {} packets",
+                            packet_count
+                        );
                         break;
                     }
 
                     if let Some(line_data) = line.as_slice() {
-                        eprintln!("Debug: Received packet in collect_wants: {:?}", 
-                                 String::from_utf8_lossy(line_data));
+                        eprintln!(
+                            "Debug: Received packet in collect_wants: {:?}",
+                            String::from_utf8_lossy(line_data)
+                        );
                         if let Some(want_line) = line_data.strip_prefix(b"want ") {
                             // Use centralized command parser
                             self.command_parser.parse_want_line(want_line, session)?;
-                            
+
                             // Handle capabilities parsing for first want line
-                            let line_str = std::str::from_utf8(want_line).map_err(|_| Error::custom("Invalid UTF-8 in want line"))?;
+                            let line_str = std::str::from_utf8(want_line)
+                                .map_err(|_| Error::custom("Invalid UTF-8 in want line"))?;
                             let line_str = line_str.trim();
                             let capabilities_str = if line_str.len() > 40 { line_str[40..].trim() } else { "" };
-                            
+
                             // Parse capabilities if present (only on first want line)
                             if !capabilities_str.is_empty() && session.capabilities == ClientCapabilities::default() {
                                 // Use centralized capability parsing from CapabilityManager
-                                session.capabilities = self.capability_manager.parse_client_capabilities(capabilities_str)?;
+                                session.capabilities =
+                                    self.capability_manager.parse_client_capabilities(capabilities_str)?;
                             }
                         } else if let Some(shallow_line) = line_data.strip_prefix(b"shallow ") {
                             // Use centralized command parser
@@ -144,7 +151,8 @@ impl<'a> Handler<'a> {
                             self.command_parser.parse_deepen_line(deepen_line, session)?;
                         } else if let Some(deepen_since_line) = line_data.strip_prefix(b"deepen-since ") {
                             // Use centralized command parser
-                            self.command_parser.parse_deepen_since_line(deepen_since_line, session)?;
+                            self.command_parser
+                                .parse_deepen_since_line(deepen_since_line, session)?;
                         } else if let Some(deepen_not_line) = line_data.strip_prefix(b"deepen-not ") {
                             // Use centralized command parser
                             self.command_parser.parse_deepen_not_line(deepen_not_line, session)?;
@@ -156,9 +164,9 @@ impl<'a> Handler<'a> {
                         } else if line_data.starts_with(b"have ") {
                             // This is a have line, end want collection and let handle_haves process it
                             let have_line = &line_data[5..]; // Remove "have " prefix
-                            // Use centralized command parser
+                                                             // Use centralized command parser
                             let _is_common = self.command_parser.parse_have_line(have_line, session)?;
-                            
+
                             // Object existence check is now handled by centralized parser
                             break;
                         }
@@ -171,11 +179,12 @@ impl<'a> Handler<'a> {
             }
         }
 
-        eprintln!("Debug: Finished collect_wants after {} packets, done={}", packet_count, session.negotiation.done);
+        eprintln!(
+            "Debug: Finished collect_wants after {} packets, done={}",
+            packet_count, session.negotiation.done
+        );
         Ok(())
     }
-
-
 
     /// Handle have/ack negotiation loop using EnhancedPacketWriter
     fn handle_haves<R: Read, W: Write>(
@@ -194,17 +203,20 @@ impl<'a> Handler<'a> {
             }
 
             if let Some(line_data) = line.as_slice() {
-                eprintln!("Debug: Received packet in handle_haves: {:?}", 
-                         String::from_utf8_lossy(line_data));
+                eprintln!(
+                    "Debug: Received packet in handle_haves: {:?}",
+                    String::from_utf8_lossy(line_data)
+                );
                 if let Some(have_line) = line_data.strip_prefix(b"have ") {
                     // Use centralized command parser
                     let is_common = self.command_parser.parse_have_line(have_line, session)?;
-                    
+
                     // Extract OID for compatibility with existing logic
                     let oid_str = std::str::from_utf8(have_line.trim_ascii())
                         .map_err(|_| Error::custom("Invalid UTF-8 in have line"))?;
-                    let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes())
-                        .map_err(|_| Error::InvalidObjectId { oid: oid_str.to_string() })?;
+                    let oid = gix_hash::ObjectId::from_hex(oid_str.as_bytes()).map_err(|_| Error::InvalidObjectId {
+                        oid: oid_str.to_string(),
+                    })?;
 
                     // Object existence check is now handled by centralized parser
                     if is_common {
@@ -240,10 +252,16 @@ impl<'a> Handler<'a> {
         }
 
         // Send final response using EnhancedPacketWriter
-        eprintln!("Debug: About to check final response, negotiation.done={}", session.negotiation.done);
+        eprintln!(
+            "Debug: About to check final response, negotiation.done={}",
+            session.negotiation.done
+        );
         if session.negotiation.done {
-            eprintln!("Debug: Negotiation done, common_found={}, can_send_pack={}", 
-                     common_found, self.can_send_pack(session)?);
+            eprintln!(
+                "Debug: Negotiation done, common_found={}, can_send_pack={}",
+                common_found,
+                self.can_send_pack(session)?
+            );
             if common_found && self.can_send_pack(session)? {
                 eprintln!("Debug: Sending ACK for common object");
                 if let Some(common_oid) = session.negotiation.common.iter().next() {
@@ -259,8 +277,6 @@ impl<'a> Handler<'a> {
 
         Ok(())
     }
-
-
 
     /// Check if we can send pack (have enough common objects)
     fn can_send_pack(&self, session: &SessionContext) -> Result<bool> {
@@ -344,7 +360,7 @@ impl<'a> ProtocolHandler for Handler<'a> {
         };
 
         let mut writer = self.packet_io_factory.create_writer(output, sideband_mode);
-        
+
         // Delegate to the method with injected I/O
         self.handle_session_with_io(&mut reader, &mut writer, session)
     }

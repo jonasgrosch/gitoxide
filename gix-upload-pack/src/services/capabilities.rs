@@ -25,7 +25,7 @@ impl<'a> CapabilityManager<'a> {
     pub fn new(repository: &'a Repository, options: &'a ServerOptions) -> Self {
         Self { repository, options }
     }
-    
+
     /// Build server capabilities using gix-protocol defaults
     pub fn build_server_capabilities(&self, protocol_version: ProtocolVersion) -> Result<Capabilities> {
         match protocol_version {
@@ -33,11 +33,11 @@ impl<'a> CapabilityManager<'a> {
                 // For V1, build capabilities using gix-protocol defaults
                 let fetch_command = Command::Fetch;
                 let default_features = fetch_command.default_features(protocol_version, &Capabilities::default());
-                
+
                 // Build capability string from default features
                 let caps_string = self.build_v1_capabilities_from_features(&default_features);
                 let full_string = format!("\0{}", caps_string);
-                
+
                 Capabilities::from_bytes(full_string.as_bytes())
                     .map(|(caps, _)| caps)
                     .map_err(|e| Error::ProtocolParsing(format!("Failed to parse V1 capabilities: {}", e)))
@@ -51,11 +51,14 @@ impl<'a> CapabilityManager<'a> {
             }
         }
     }
-    
+
     /// Build V1 capabilities from gix-protocol features
-    fn build_v1_capabilities_from_features(&self, features: &[(&str, Option<std::borrow::Cow<'static, str>>)]) -> String {
+    fn build_v1_capabilities_from_features(
+        &self,
+        features: &[(&str, Option<std::borrow::Cow<'static, str>>)],
+    ) -> String {
         let mut cap_strings = Vec::new();
-        
+
         // Add protocol-defined features
         for (feature, value) in features {
             if let Some(val) = value {
@@ -64,7 +67,7 @@ impl<'a> CapabilityManager<'a> {
                 cap_strings.push(feature.to_string());
             }
         }
-        
+
         // Add server-specific capabilities
         if self.options.allow_filter {
             cap_strings.push("filter".to_string());
@@ -75,51 +78,52 @@ impl<'a> CapabilityManager<'a> {
         if self.options.allow_reachable_sha1_in_want {
             cap_strings.push("allow-reachable-sha1-in-want".to_string());
         }
-        
+
         // Agent string
         cap_strings.push(format!("agent=git/gitoxide-{}", crate::VERSION));
-        
+
         cap_strings.join(" ")
     }
-    
+
     /// Build V2 capabilities with proper command integration
     fn build_v2_capabilities_with_commands(&self) -> String {
         let mut caps = Vec::new();
-        
+
         // Agent capability
         caps.push(format!("agent=git/gitoxide-{}", crate::VERSION));
-        
+
         // Object format
         caps.push("object-format=sha1".to_string());
-        
+
         // Get default capabilities for V2
         let default_caps = Capabilities::default();
-        
+
         // Fetch command with its features
         let fetch_command = Command::Fetch;
         let fetch_features = fetch_command.default_features(ProtocolVersion::V2, &default_caps);
         let mut fetch_cap_strings = Vec::new();
-        
+
         for (feature, _) in &fetch_features {
-            if *feature != "fetch" { // Don't include the command name itself
+            if *feature != "fetch" {
+                // Don't include the command name itself
                 fetch_cap_strings.push(feature.to_string());
             }
         }
-        
+
         // Add server-specific fetch capabilities
         if self.options.allow_filter {
             if !fetch_cap_strings.contains(&"filter".to_string()) {
                 fetch_cap_strings.push("filter".to_string());
             }
         }
-        
+
         caps.push(format!("fetch={}", fetch_cap_strings.join(" ")));
-        
+
         // ls-refs command with its features
         let ls_refs_command = Command::LsRefs;
         let ls_refs_features = ls_refs_command.default_features(ProtocolVersion::V2, &default_caps);
         let mut ls_refs_cap_strings = vec!["symrefs".to_string(), "peel".to_string(), "unborn".to_string()];
-        
+
         for (feature, _) in &ls_refs_features {
             if *feature != "ls-refs" && !ls_refs_cap_strings.contains(&feature.to_string()) {
                 ls_refs_cap_strings.push(feature.to_string());
@@ -127,22 +131,20 @@ impl<'a> CapabilityManager<'a> {
         }
 
         caps.push(format!("ls-refs={}", ls_refs_cap_strings.join(" ")));
-        
+
         caps.join("\n")
     }
-    
 
-    
     /// Get the default server capabilities based on repository and configuration
     pub fn default_server_capabilities(&self) -> ServerCapabilities {
         ServerCapabilities::default()
     }
-    
+
     /// Parse client capabilities from capability string (centralized from v1)
     /// This replaces the duplicate parsing logic in v1 protocol
     pub fn parse_client_capabilities(&self, caps_str: &str) -> Result<ClientCapabilities> {
         let mut capabilities = ClientCapabilities::default();
-        
+
         for cap in caps_str.split_whitespace() {
             match cap {
                 "multi_ack" => capabilities.multi_ack = MultiAckMode::Basic,
@@ -184,14 +186,14 @@ impl<'a> CapabilityManager<'a> {
                 }
             }
         }
-        
+
         Ok(capabilities)
     }
-    
+
     /// Get V1 capability strings (without writing to any writer)
     pub fn get_v1_capability_strings(&self, caps: &ServerCapabilities) -> Vec<String> {
         let mut cap_strings = Vec::new();
-        
+
         // Multi-ack capabilities - Git advertises both when detailed is supported
         match caps.multi_ack {
             MultiAckMode::None => {}
@@ -201,63 +203,63 @@ impl<'a> CapabilityManager<'a> {
                 // multi_ack_detailed will be added later in the correct position
             }
         }
-        
+
         if caps.thin_pack {
             cap_strings.push("thin-pack".to_string());
         }
-        
+
         // Side-band capabilities
         cap_strings.extend(caps.side_band.to_capability_strings().iter().map(|s| s.to_string()));
-        
+
         if caps.ofs_delta {
             cap_strings.push("ofs-delta".to_string());
         }
-        
+
         if caps.shallow {
             cap_strings.push("shallow".to_string());
         }
-        
+
         if caps.deepen_since {
             cap_strings.push("deepen-since".to_string());
         }
-        
+
         if caps.deepen_not {
             cap_strings.push("deepen-not".to_string());
         }
-        
+
         if caps.deepen_relative {
             cap_strings.push("deepen-relative".to_string());
         }
-        
+
         if caps.no_progress {
             cap_strings.push("no-progress".to_string());
         }
-        
+
         if caps.include_tag {
             cap_strings.push("include-tag".to_string());
         }
-        
+
         // Add multi_ack_detailed after no-progress and include-tag (Git's order)
         if caps.multi_ack == MultiAckMode::Detailed {
             cap_strings.push("multi_ack_detailed".to_string());
         }
-        
+
         if caps.no_done {
             cap_strings.push("no-done".to_string());
         }
-        
+
         if caps.filter {
             cap_strings.push("filter".to_string());
         }
-        
+
         if caps.allow_tip_sha1_in_want {
             cap_strings.push("allow-tip-sha1-in-want".to_string());
         }
-        
+
         if caps.allow_reachable_sha1_in_want {
             cap_strings.push("allow-reachable-sha1-in-want".to_string());
         }
-        
+
         // Add symref capability for HEAD
         if let Ok(head) = self.repository.head() {
             if let gix::head::Kind::Symbolic(target_ref) = head.kind {
@@ -269,15 +271,15 @@ impl<'a> CapabilityManager<'a> {
         if !caps.object_format.is_empty() {
             cap_strings.push("object-format=sha1".to_string());
         }
-        
+
         // Agent
         cap_strings.push(format!("agent={}", caps.agent.to_str_lossy()));
-        
+
         // Session ID if available
         if let Some(session_id) = &caps.session_id {
             cap_strings.push(format!("session-id={}", session_id.to_str_lossy()));
         }
-        
+
         cap_strings
     }
 
@@ -285,29 +287,34 @@ impl<'a> CapabilityManager<'a> {
     pub fn server_capabilities_to_v1_string(&self, caps: &ServerCapabilities) -> String {
         self.get_v1_capability_strings(caps).join(" ")
     }
-    
+
     /// Validate V2 command arguments using gix-protocol
     /// Now that we've fixed gix-protocol to accept standard git capabilities
     pub fn validate_v2_command(
-        &self, 
-        command: crate::types::Command, 
-        args: &[bstr::BString], 
-        server_caps: &Capabilities
-    ) -> Result<()> {        
+        &self,
+        command: crate::types::Command,
+        args: &[bstr::BString],
+        server_caps: &Capabilities,
+    ) -> Result<()> {
         // Create features from server capabilities
         let features = command.default_features(ProtocolVersion::V2, server_caps);
-        
+
         // Validate using gix-protocol's validation (now fixed to accept standard capabilities)
-        command.validate_argument_prefixes(ProtocolVersion::V2, server_caps, args, &features)
+        command
+            .validate_argument_prefixes(ProtocolVersion::V2, server_caps, args, &features)
             .map_err(|e| Error::ProtocolParsing(format!("Command validation failed: {}", e)))
     }
-    
+
     /// Get initial arguments for a V2 command
-    pub fn get_initial_v2_arguments(&self, command: crate::types::Command, server_caps: &Capabilities) -> Vec<bstr::BString> {
+    pub fn get_initial_v2_arguments(
+        &self,
+        command: crate::types::Command,
+        server_caps: &Capabilities,
+    ) -> Vec<bstr::BString> {
         let features = command.default_features(ProtocolVersion::V2, server_caps);
         command.initial_v2_arguments(&features)
     }
-    
+
     /// Check if a capability is supported by the server
     pub fn supports_capability(&self, caps: &Capabilities, capability: &str) -> bool {
         caps.contains(capability)

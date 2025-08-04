@@ -10,7 +10,6 @@ pub mod protocol {
     /// Common protocol messages
     pub const NAK: &[u8] = b"NAK\n";
 
-    
     /// ACK message prefixes
     pub const ACK_PREFIX: &str = "ACK ";
     pub const ACK_CONTINUE_SUFFIX: &str = " continue";
@@ -22,10 +21,10 @@ pub use gix_transport::client::Capabilities;
 pub use gix_transport::Protocol as ProtocolVersion;
 
 // Re-export protocol types for gradual migration
+pub use gix_packetline::Channel as SideBandChannel;
+pub use gix_protocol::fetch::response::Acknowledgement;
 pub use gix_protocol::handshake::Ref as ProtocolRef;
 pub use gix_protocol::Command;
-pub use gix_protocol::fetch::response::Acknowledgement;
-pub use gix_packetline::Channel as SideBandChannel;
 pub use gix_shallow::Update as ShallowUpdate;
 
 // Use ProtocolRef directly as our Reference type
@@ -72,7 +71,7 @@ impl SideBandMode {
     pub fn max_data_size(self) -> Option<usize> {
         match self {
             SideBandMode::None => None,
-            SideBandMode::Basic => Some(999),      // 1000 - 1 byte for channel
+            SideBandMode::Basic => Some(999),         // 1000 - 1 byte for channel
             SideBandMode::SideBand64k => Some(65515), // gix-packetline limit with safety margin
         }
     }
@@ -103,7 +102,7 @@ impl SideBandMode {
             SideBandMode::SideBand64k => vec!["side-band", "side-band-64k"],
         }
     }
-    
+
     /// Convert to protocol v2 capability strings
     pub fn to_v2_capability_strings(&self) -> Vec<&'static str> {
         match self {
@@ -413,12 +412,12 @@ mod tests {
         assert!(!SideBandMode::None.supports_channel(SideBandChannel::Data));
         assert!(!SideBandMode::None.supports_channel(SideBandChannel::Progress));
         assert!(!SideBandMode::None.supports_channel(SideBandChannel::Error));
-        
+
         // Basic only supports Progress
         assert!(!SideBandMode::Basic.supports_channel(SideBandChannel::Data));
         assert!(SideBandMode::Basic.supports_channel(SideBandChannel::Progress));
         assert!(!SideBandMode::Basic.supports_channel(SideBandChannel::Error));
-        
+
         // SideBand64k supports all channels
         assert!(SideBandMode::SideBand64k.supports_channel(SideBandChannel::Data));
         assert!(SideBandMode::SideBand64k.supports_channel(SideBandChannel::Progress));
@@ -427,8 +426,14 @@ mod tests {
 
     #[test]
     fn test_sideband_mode_from_capability_string() {
-        assert_eq!(SideBandMode::from_capability_string("side-band"), Some(SideBandMode::Basic));
-        assert_eq!(SideBandMode::from_capability_string("side-band-64k"), Some(SideBandMode::SideBand64k));
+        assert_eq!(
+            SideBandMode::from_capability_string("side-band"),
+            Some(SideBandMode::Basic)
+        );
+        assert_eq!(
+            SideBandMode::from_capability_string("side-band-64k"),
+            Some(SideBandMode::SideBand64k)
+        );
         assert_eq!(SideBandMode::from_capability_string("unknown"), None);
         assert_eq!(SideBandMode::from_capability_string(""), None);
     }
@@ -437,27 +442,45 @@ mod tests {
     fn test_sideband_mode_to_capability_strings() {
         assert_eq!(SideBandMode::None.to_capability_strings(), Vec::<&str>::new());
         assert_eq!(SideBandMode::Basic.to_capability_strings(), vec!["side-band"]);
-        assert_eq!(SideBandMode::SideBand64k.to_capability_strings(), vec!["side-band", "side-band-64k"]);
+        assert_eq!(
+            SideBandMode::SideBand64k.to_capability_strings(),
+            vec!["side-band", "side-band-64k"]
+        );
     }
 
     #[test]
     fn test_sideband_mode_to_v2_capability_strings() {
         assert_eq!(SideBandMode::None.to_v2_capability_strings(), Vec::<&str>::new());
         assert_eq!(SideBandMode::Basic.to_v2_capability_strings(), vec!["sideband"]);
-        assert_eq!(SideBandMode::SideBand64k.to_v2_capability_strings(), vec!["sideband-all"]);
+        assert_eq!(
+            SideBandMode::SideBand64k.to_v2_capability_strings(),
+            vec!["sideband-all"]
+        );
     }
 
     #[test]
     fn test_capability_roundtrip() {
         // Test v1 capabilities
-        assert_eq!(SideBandMode::from_capability_string("side-band"), Some(SideBandMode::Basic));
-        assert_eq!(SideBandMode::from_capability_string("side-band-64k"), Some(SideBandMode::SideBand64k));
-        
+        assert_eq!(
+            SideBandMode::from_capability_string("side-band"),
+            Some(SideBandMode::Basic)
+        );
+        assert_eq!(
+            SideBandMode::from_capability_string("side-band-64k"),
+            Some(SideBandMode::SideBand64k)
+        );
+
         // Test that the first capability from SideBand64k mode can roundtrip to Basic
         // (This is expected behavior since "side-band" appears first)
         let sideband64k_caps = SideBandMode::SideBand64k.to_capability_strings();
         assert_eq!(sideband64k_caps, vec!["side-band", "side-band-64k"]);
-        assert_eq!(SideBandMode::from_capability_string(sideband64k_caps[0]), Some(SideBandMode::Basic));
-        assert_eq!(SideBandMode::from_capability_string(sideband64k_caps[1]), Some(SideBandMode::SideBand64k));
+        assert_eq!(
+            SideBandMode::from_capability_string(sideband64k_caps[0]),
+            Some(SideBandMode::Basic)
+        );
+        assert_eq!(
+            SideBandMode::from_capability_string(sideband64k_caps[1]),
+            Some(SideBandMode::SideBand64k)
+        );
     }
 }

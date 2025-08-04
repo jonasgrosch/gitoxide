@@ -3,15 +3,15 @@
 //! This service provides a factory for creating packet I/O objects,
 //! allowing for better dependency injection and testability.
 
-use std::io::{Read, Write};
 use crate::{
     error::{Error, Result},
-    types::{AckStatus, SideBandChannel, SideBandMode, protocol},
+    types::{protocol, AckStatus, SideBandChannel, SideBandMode},
 };
 use gix_packetline::{
     encode::{band_to_write, data_to_write, delim_to_write, error_to_write, flush_to_write, response_end_to_write},
     PacketLineRef, StreamingPeekableIter,
 };
+use std::io::{Read, Write};
 
 /// Factory for creating packet I/O objects
 pub struct PacketIOFactory;
@@ -53,10 +53,7 @@ pub struct EnhancedPacketReader<R: Read> {
 impl<R: Read> EnhancedPacketReader<R> {
     /// Create a new enhanced packet reader
     pub fn new(reader: R, _trace: bool) -> Self {
-        let delimiters = &[
-            PacketLineRef::Delimiter,
-            PacketLineRef::ResponseEnd,
-        ];
+        let delimiters = &[PacketLineRef::Delimiter, PacketLineRef::ResponseEnd];
 
         let packet_reader = StreamingPeekableIter::new(reader, delimiters, true); // Enable tracing
 
@@ -131,7 +128,9 @@ impl<R: Read> EnhancedPacketReader<R> {
 
 impl<R: Read> EnhancedPacketReader<R> {
     /// Read the next line (similar to StreamingPeekableIter::read_line)
-    pub fn read_line(&mut self) -> Option<std::io::Result<std::result::Result<PacketLineRef<'_>, gix_packetline::decode::Error>>> {
+    pub fn read_line(
+        &mut self,
+    ) -> Option<std::io::Result<std::result::Result<PacketLineRef<'_>, gix_packetline::decode::Error>>> {
         self.reader.read_line()
     }
 
@@ -143,19 +142,19 @@ impl<R: Read> EnhancedPacketReader<R> {
     /// Read packets until flush, returning all data packets
     pub fn read_until_flush(&mut self) -> Result<Vec<Vec<u8>>> {
         let mut packets = Vec::new();
-        
+
         while let Some(line_result) = self.read_line() {
             let line = line_result.map_err(Error::Io)?.map_err(Error::PacketlineDecode)?;
-            
+
             if Self::is_flush_packet(&line) {
                 break;
             }
-            
+
             if let Some(data) = line.as_slice() {
                 packets.push(data.to_vec());
             }
         }
-        
+
         Ok(packets)
     }
 }
@@ -190,8 +189,6 @@ impl<W: Write> EnhancedPacketWriter<W> {
         }
         Ok(())
     }
-
-
 
     /// Send progress message through the progress channel
     pub fn send_progress(&mut self, message: &str) -> Result<()> {
@@ -301,12 +298,7 @@ impl<W: Write> EnhancedPacketWriter<W> {
     }
 
     /// Send a reference line with capabilities
-    pub fn send_ref_with_capabilities(
-        &mut self,
-        oid_hex: &str,
-        refname: &str,
-        capabilities: &str,
-    ) -> Result<()> {
+    pub fn send_ref_with_capabilities(&mut self, oid_hex: &str, refname: &str, capabilities: &str) -> Result<()> {
         let line = format!("{} {}\0{}\n", oid_hex, refname, capabilities);
         self.send_data(line.as_bytes())?;
         Ok(())
@@ -349,14 +341,14 @@ pub struct BufferedSideBandWriter<W: Write> {
 impl<W: Write> BufferedSideBandWriter<W> {
     pub fn new(writer: EnhancedPacketWriter<W>) -> Self {
         let max_packet_size = writer.mode.max_data_size().unwrap_or(65515);
-        
+
         Self {
             writer,
             buffer: Vec::with_capacity(max_packet_size),
             max_packet_size,
         }
     }
-    
+
     pub fn into_inner(mut self) -> std::io::Result<EnhancedPacketWriter<W>> {
         self.flush()?;
         Ok(self.writer)
@@ -373,22 +365,22 @@ impl<W: Write> Write for BufferedSideBandWriter<W> {
             SideBandMode::Basic | SideBandMode::SideBand64k => {
                 let mut remaining = buf;
                 let mut total_written = 0;
-                
+
                 while !remaining.is_empty() {
                     let space_left = self.max_packet_size - self.buffer.len();
-                    
+
                     if space_left == 0 {
                         // Buffer is full, flush it
                         self.flush_buffer()?;
                         continue;
                     }
-                    
+
                     let to_copy = remaining.len().min(space_left);
                     self.buffer.extend_from_slice(&remaining[..to_copy]);
                     remaining = &remaining[to_copy..];
                     total_written += to_copy;
                 }
-                
+
                 Ok(total_written)
             }
         }

@@ -7,8 +7,8 @@
 use crate::{
     config::ServerOptions,
     error::{Error, Result},
-    services::packet_io::EnhancedPacketWriter,
     services::pack::ProgressReporter,
+    services::packet_io::EnhancedPacketWriter,
     types::*,
 };
 use gix::Repository;
@@ -17,8 +17,8 @@ use gix_features::{
     progress::{self},
 };
 use gix_pack::data::output;
-use std::sync::atomic::AtomicBool;
 use std::io::Write;
+use std::sync::atomic::AtomicBool;
 
 /// Adapter to make Repository objects compatible with gix_pack::Find trait
 #[derive(Clone)]
@@ -110,8 +110,6 @@ pub struct PackStats {
     pub delta_objects: u32,
     /// Compression ratio achieved
     pub compression_ratio: f64,
-    /// Time taken for pack generation
-    pub generation_time_ms: u64,
 }
 
 /// Git-native pack configuration values for compatibility
@@ -154,18 +152,12 @@ impl<'a> PackGenerator<'a> {
     }
 
     /// Generate a pack file using EnhancedPacketWriter for proper sideband handling
-    pub fn generate_pack<W: Write>(&self, writer: &mut EnhancedPacketWriter<W>, session: &SessionContext) -> Result<PackStats> {
-        let start_time = std::time::Instant::now();
-        
-        eprintln!("Debug: Pack generation called with capabilities: thin_pack={}, ofs_delta={}, no_progress={}, side_band={:?}", 
-                 session.capabilities.thin_pack, session.capabilities.ofs_delta, 
-                 session.capabilities.no_progress, session.capabilities.side_band);
-
-        // Step 1: Prepare minimal object IDs (just wants, let gix-pack do the expansion)
-        let prepare_start = std::time::Instant::now();
+    pub fn generate_pack<W: Write>(
+        &self,
+        writer: &mut EnhancedPacketWriter<W>,
+        session: &SessionContext,
+    ) -> Result<PackStats> {
         let object_ids = self.prepare_minimal_objects(session)?;
-        let prepare_duration = prepare_start.elapsed();
-        eprintln!("Pack generation timing: Object preparation took {:?}", prepare_duration);
 
         if object_ids.is_empty() {
             // Return empty pack
@@ -174,38 +166,19 @@ impl<'a> PackGenerator<'a> {
 
         // Step 2: Use gix-pack's count::objects to analyze and expand the objects
         // This replaces our manual enumeration - gix-pack will do tree traversal for us
-        let count_start = std::time::Instant::now();
         let (counts, count_stats) = self.count_objects_with_expansion(object_ids, writer, session)?;
-        let count_duration = count_start.elapsed();
-        eprintln!(
-            "Pack generation timing: Object counting with expansion took {:?}",
-            count_duration
-        );
 
         // Step 3: Compress and stream pack data using gix-pack's FromEntriesIter
-        let pack_start = std::time::Instant::now();
         let pack_stats = self.stream_pack_data(writer, counts, count_stats.total_objects, session)?;
-        let pack_duration = pack_start.elapsed();
-        eprintln!("Pack generation timing: Pack streaming took {:?}", pack_duration);
 
         // Step 4: Send final status message (Git-compatible)
-        let status_start = std::time::Instant::now();
         self.send_final_status(writer, &pack_stats, session)?;
-        let status_duration = status_start.elapsed();
-        eprintln!("Pack generation timing: Final status took {:?}", status_duration);
-
-        let generation_time = start_time.elapsed();
-        eprintln!(
-            "Pack generation timing: Total pack generation took {:?}",
-            generation_time
-        );
 
         Ok(PackStats {
             object_count: pack_stats.object_count,
             pack_size: pack_stats.pack_size,
             delta_objects: pack_stats.delta_objects,
             compression_ratio: pack_stats.compression_ratio,
-            generation_time_ms: generation_time.as_millis() as u64,
         })
     }
 
@@ -343,13 +316,11 @@ impl<'a> PackGenerator<'a> {
         }
         // Send progress message if progress is enabled
         if !session.capabilities.no_progress {
-            writer.send_progress(&format!(
-                "Enumerating objects: {}, done.",
-                stats.total_objects
-            ))?;
+            writer.send_progress(&format!("Enumerating objects: {}, done.", stats.total_objects))?;
         }
 
-        let mut progress_reporter = ProgressReporter::new(writer, "Counting objects".to_string(), Some(stats.total_objects));
+        let mut progress_reporter =
+            ProgressReporter::new(writer, "Counting objects".to_string(), Some(stats.total_objects));
 
         let _actual_count = counts.iter().fold(ObjectCount::default(), |mut c, _e| {
             c.add(gix_pack::data::output::entry::Kind::Base(gix_object::Kind::Blob));
@@ -427,13 +398,12 @@ impl<'a> PackGenerator<'a> {
             c
         });
 
-        eprintln!("Debug: Entry stats: {:?}", entry_stats);
         progress_reporter.finish()?;
 
         // CRITICAL FIX: Use a temporary buffer to collect all pack data first,
         // then write it in properly sized sideband packets
         let pack_writer_start = std::time::Instant::now();
-        
+
         // Write pack data to a temporary buffer first
         let mut pack_buffer = Vec::new();
         let mut pack_writer = output::bytes::FromEntriesIter::new(
@@ -458,15 +428,16 @@ impl<'a> PackGenerator<'a> {
             total_bytes_written += bytes_written;
         }
         let streaming_duration = streaming_start.elapsed();
-        
+
         // Get the final pack digest before we use the buffer
         let pack_digest = pack_writer
             .digest()
             .ok_or_else(|| Error::Pack("Pack generation incomplete".to_string()))?;
-        
+
         eprintln!(
             "Pack streaming timing: Pack data generation took {:?}, {} bytes",
-            streaming_duration, pack_buffer.len()
+            streaming_duration,
+            pack_buffer.len()
         );
 
         // Now write the complete pack data through the sideband writer in proper chunks
@@ -520,7 +491,6 @@ impl<'a> PackGenerator<'a> {
             pack_size: 32, // Empty pack size (header + checksum)
             delta_objects: 0,
             compression_ratio: 1.0,
-            generation_time_ms: 0,
         })
     }
 

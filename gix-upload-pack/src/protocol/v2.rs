@@ -7,7 +7,11 @@ use crate::{
     config::ServerOptions,
     error::{Error, Result},
     protocol::ProtocolHandler,
-    services::{CapabilityManager, pack::PackGenerator, {packet_io::{EnhancedPacketReader, EnhancedPacketWriter}}},
+    services::{
+        pack::PackGenerator,
+        packet_io::{EnhancedPacketReader, EnhancedPacketWriter},
+        CapabilityManager,
+    },
     types::*,
 };
 use bstr::ByteSlice;
@@ -59,9 +63,11 @@ impl<'a> Handler<'a> {
     fn advertise_capabilities<W: Write>(&self, writer: &mut W) -> Result<()> {
         // Use injected packet I/O factory
         let mut packet_writer = self.packet_io_factory.create_temp_writer(writer);
-        
+
         // Get capability lines from capability manager (no direct writing)
-        let capability_lines = self.capability_manager.get_v2_capability_lines(&self.options.capabilities);
+        let capability_lines = self
+            .capability_manager
+            .get_v2_capability_lines(&self.options.capabilities);
 
         // Send capability lines through packet writer
         for line in capability_lines {
@@ -78,30 +84,26 @@ impl<'a> Handler<'a> {
     fn advertise_refs<W: Write>(&self, writer: &mut EnhancedPacketWriter<W>) -> Result<()> {
         // For advertise-refs mode, use the exact format that native git uses
         // This is simpler than the full capability negotiation format
-        
+
         // Version line
         writer.write_protocol_message(b"version 2\n")?;
-        
+
         // Agent capability
         let agent = format!("agent=git/gitoxide-{}\n", crate::VERSION);
         writer.write_protocol_message(agent.as_bytes())?;
-        
+
         // Commands in the exact order that native git uses
         writer.write_protocol_message(b"ls-refs=unborn\n")?;
         writer.write_protocol_message(b"fetch=shallow wait-for-done\n")?;
         writer.write_protocol_message(b"server-option\n")?;
         writer.write_protocol_message(b"object-format=sha1\n")?;
         writer.write_protocol_message(b"object-info\n")?;
-        
+
         // End with flush packet
         writer.write_flush()?;
-        
+
         Ok(())
     }
-
-
-
-
 
     /// Parse command arguments for V2
     fn parse_command_arguments_v2<R: BufRead>(
@@ -128,7 +130,6 @@ impl<'a> Handler<'a> {
                             || line_str.starts_with("deepen")
                             || line_str == "done"
                         {
-                            eprintln!("Debug: Stopping argument parsing at fetch parameter: {}", line_str);
                             true // Don't consume this line, leave it for read_fetch_parameters
                         } else {
                             false // This is an argument line, will process it below
@@ -273,8 +274,6 @@ impl<'a> Handler<'a> {
         args: &HashMap<String, String>,
         session: &mut SessionContext,
     ) -> Result<()> {
-        eprintln!("Debug: handle_fetch called with args: {:?}", args);
-
         // Get server capabilities for validation
         let server_caps = self.capability_manager.build_server_capabilities(ProtocolVersion::V2)?;
 
@@ -324,22 +323,11 @@ impl<'a> Handler<'a> {
             SideBandMode::SideBand64k
         };
 
-        eprintln!(
-            "Debug: Set session.capabilities.side_band to {:?} (sideband_all: {})",
-            session.capabilities.side_band, sideband_all
-        );
-
         // Update writer's sideband mode based on negotiated capabilities
         writer.set_sideband_mode(session.capabilities.side_band);
 
         // Read fetch parameters
         self.read_fetch_parameters(reader, session)?;
-
-        eprintln!(
-            "Debug: After reading parameters, wants: {:?}, haves: {:?}",
-            session.negotiation.wants.len(),
-            session.negotiation.haves.len()
-        );
 
         // Perform negotiation if needed
         if !session.negotiation.wants.is_empty() {
@@ -378,11 +366,6 @@ impl<'a> Handler<'a> {
             // Send packfile section
             writer.write_protocol_message(b"packfile\n")?;
 
-            eprintln!(
-                "Debug: About to generate pack for {} wants",
-                session.negotiation.wants.len()
-            );
-
             // Generate and send pack using EnhancedPacketWriter for proper sideband handling
             let pack_generator = self.pack_generator;
             let pack_stats = pack_generator.generate_pack(writer, session)?;
@@ -420,7 +403,8 @@ impl<'a> Handler<'a> {
                     self.command_parser.parse_deepen_line(deepen_line, session)?;
                 } else if let Some(deepen_since_line) = line_data.strip_prefix(b"deepen-since ") {
                     // Use centralized command parser
-                    self.command_parser.parse_deepen_since_line(deepen_since_line, session)?;
+                    self.command_parser
+                        .parse_deepen_since_line(deepen_since_line, session)?;
                 } else if let Some(deepen_not_line) = line_data.strip_prefix(b"deepen-not ") {
                     // Use centralized command parser
                     self.command_parser.parse_deepen_not_line(deepen_not_line, session)?;
@@ -489,8 +473,6 @@ impl<'a> Handler<'a> {
         // Parse command arguments - but STOP at first flush or want/have line
         let args = self.parse_command_arguments_v2(&mut line_reader)?;
 
-        eprintln!("Debug: Parsed command arguments: {:?}", args);
-
         // Handle the command
         match command {
             Some(Command::LsRefs) => {
@@ -509,15 +491,10 @@ impl<'a> Handler<'a> {
 }
 
 impl<'a> ProtocolHandler for Handler<'a> {
-    fn handle_session<R: Read, W: Write>(
-        &mut self,
-        input: R,
-        output: W,
-        session: &mut SessionContext,
-    ) -> Result<()> {
+    fn handle_session<R: Read, W: Write>(&mut self, input: R, output: W, session: &mut SessionContext) -> Result<()> {
         // Use injected packet I/O factory
         let reader = self.packet_io_factory.create_reader(input, false);
-        
+
         // For advertise-refs mode, never use sideband (Git protocol requirement)
         let sideband_mode = if self.options.advertise_refs {
             crate::types::SideBandMode::None
@@ -525,9 +502,9 @@ impl<'a> ProtocolHandler for Handler<'a> {
             // Start with no sideband - will be updated after capability negotiation
             crate::types::SideBandMode::None
         };
-        
+
         let mut writer = self.packet_io_factory.create_writer(output, sideband_mode);
-        
+
         // Delegate to the method with injected I/O
         self.handle_session_with_io(reader, &mut writer, session)
     }

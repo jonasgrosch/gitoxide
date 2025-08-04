@@ -3,14 +3,14 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gix_upload_pack::server::Server;
 use gix_upload_pack::config::ServerOptions;
+use gix_upload_pack::server::Server;
 
 /// Git upload-pack server implementation for gitoxide
-/// 
+///
 /// This is a drop-in replacement for Git's native upload-pack command,
 /// providing the same functionality with improved performance and reliability.
-/// 
+///
 /// The upload-pack protocol is used by Git clients to fetch objects from
 /// a repository. This implementation supports all Git protocol versions
 /// (v0, v1, v2) and maintains byte-for-byte compatibility with native Git.
@@ -38,7 +38,7 @@ use gix_upload_pack::config::ServerOptions;
 )]
 struct Args {
     /// The repository directory to serve
-    /// 
+    ///
     /// This should be the path to a Git repository (either a bare repository
     /// ending in .git or a working directory containing a .git subdirectory).
     /// The path will be validated to ensure it contains a valid Git repository.
@@ -54,7 +54,7 @@ struct Args {
     directory: PathBuf,
 
     /// Quit after a single request/response exchange
-    /// 
+    ///
     /// This mode is used by Git's HTTP transport and other stateless protocols.
     /// The server will process one request and then exit, rather than maintaining
     /// a persistent connection for multiple operations.
@@ -73,7 +73,7 @@ struct Args {
     stateless_rpc: bool,
 
     /// Serve up the info/refs for git-http-backend
-    /// 
+    ///
     /// This mode is used by Git's HTTP transport to advertise available references.
     /// The server will output the reference advertisement and exit, without
     /// processing any fetch requests.
@@ -93,7 +93,7 @@ struct Args {
     advertise_refs: bool,
 
     /// Do not try <directory>/.git/ if <directory> is no Git directory
-    /// 
+    ///
     /// By default, if the specified directory is not a Git repository,
     /// the server will try appending /.git to find a repository.
     /// This flag disables that behavior.
@@ -116,7 +116,7 @@ struct Args {
     strict: bool,
 
     /// Try <directory>/.git/ if <directory> is no Git directory
-    /// 
+    ///
     /// This explicitly enables the default behavior of looking for a .git
     /// subdirectory. This flag overrides --strict if both are specified.
     #[arg(
@@ -137,7 +137,7 @@ struct Args {
     no_strict: bool,
 
     /// Interrupt transfer after <n> seconds of inactivity
-    /// 
+    ///
     /// Sets a timeout for client connections. If no data is received from
     /// the client for the specified number of seconds, the connection will
     /// be terminated. A value of 0 disables the timeout.
@@ -169,7 +169,8 @@ impl Args {
     fn validate(&self) -> Result<(), String> {
         // Validate timeout value
         if let Some(timeout) = self.timeout {
-            if timeout > 86400 {  // 24 hours
+            if timeout > 86400 {
+                // 24 hours
                 return Err("Timeout cannot exceed 86400 seconds (24 hours)".to_string());
             }
         }
@@ -179,20 +180,12 @@ impl Args {
             return Err(format!("Directory does not exist: {}", self.directory.display()));
         }
 
-        // Check for conflicting stateless options
-        if self.stateless_rpc && !self.advertise_refs && !self.http_backend_info_refs {
-            // This is actually valid - stateless-rpc can be used for fetch operations too
-            // No error needed here
-        }
-
         Ok(())
     }
 
     /// Convert parsed arguments to ServerOptions
     fn to_server_options(&self) -> ServerOptions {
-        let timeout = self.timeout
-            .filter(|&t| t > 0)
-            .map(|t| Duration::from_secs(t as u64));
+        let timeout = self.timeout.filter(|&t| t > 0).map(|t| Duration::from_secs(t as u64));
 
         let advertise_refs = self.advertise_refs || self.http_backend_info_refs;
         let strict = self.strict && !self.no_strict;
@@ -234,12 +227,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdout = io::stdout();
     let mut stdin_lock = stdin.lock();
     let mut stdout_lock = stdout.lock();
-    
+
     // Process the upload-pack protocol
     if let Err(e) = server.serve(&mut stdin_lock, &mut stdout_lock) {
         eprintln!("Error serving upload-pack protocol: {e}");
         std::process::exit(1);
     }
-    
+
     Ok(())
 }

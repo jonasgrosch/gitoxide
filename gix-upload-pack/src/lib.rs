@@ -6,7 +6,7 @@
 //! native upload-pack implementation.
 //!
 //! # Features
-//! 
+//!
 //! - Full protocol v1 and v2 support
 //! - Shallow clone and partial clone support
 //! - Object filtering (blob size, tree depth, etc.)
@@ -29,7 +29,7 @@
 //!     .with_advertise_refs(false);
 //!     
 //! let mut server = Server::new("/path/to/repo", options)?;
-//! 
+//!
 //! // Handle upload-pack protocol (now synchronous)
 //! let stdin = stdin();
 //! let stdout = stdout();
@@ -40,16 +40,16 @@
 #![deny(rust_2018_idioms)]
 // #![warn(missing_docs, clippy::all, clippy::pedantic)]
 
+pub mod config;
 pub mod error;
+pub mod protocol;
 pub mod server;
 pub mod services;
-pub mod config;
-pub mod protocol;
 mod types;
 
+pub use config::ServerOptions;
 pub use error::{Error, Result};
 pub use server::Server;
-pub use config::ServerOptions;
 pub use types::*;
 
 /// The version of this crate
