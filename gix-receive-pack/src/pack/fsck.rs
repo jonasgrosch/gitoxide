@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use gix_hash::ObjectId;
-use gix_object::{Kind, Find};
+use gix_object::Kind;
+
+// Error handling integration will be added when fsck validation is implemented
 
 /// Configuration for fsck validation during pack ingestion.
 #[derive(Debug, Clone)]

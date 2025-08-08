@@ -21,6 +21,7 @@ Design principles
 
 pub mod protocol;
 pub mod pack;
+pub mod error;
 #[cfg(feature = "progress")]
 pub mod progress;
 
@@ -54,8 +55,9 @@ pub enum Kind {
 }
 
 /// Error type for operations provided by this crate.
-//
-/// This is intentionally minimal to keep the skeleton buildable while we iterate.
+///
+/// This enum provides backward compatibility while delegating to the comprehensive
+/// error handling system for pack ingestion operations.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     /// Placeholder error for unimplemented operations.
@@ -79,6 +81,9 @@ pub enum Error {
     /// Fsck verification failed.
     #[error("fsck failed: {0}")]
     Fsck(String),
+    /// Comprehensive pack ingestion error with detailed context and recovery information.
+    #[error("pack ingestion error: {0}")]
+    PackIngestion(#[from] crate::error::PackIngestionError),
 }
 
 impl Error {
@@ -92,6 +97,48 @@ impl Error {
             Error::Resource(_) => Kind::Resource,
             Error::Cancelled => Kind::Cancelled,
             Error::Fsck(_) => Kind::Validation,
+            Error::PackIngestion(err) => match err.kind() {
+                crate::error::ErrorKind::Io => Kind::Io,
+                crate::error::ErrorKind::Protocol => Kind::Protocol,
+                crate::error::ErrorKind::Validation => Kind::Validation,
+                crate::error::ErrorKind::Resource => Kind::Resource,
+                crate::error::ErrorKind::Cancelled => Kind::Cancelled,
+                crate::error::ErrorKind::Permission => Kind::Permission,
+                crate::error::ErrorKind::NotFound => Kind::NotFound,
+                crate::error::ErrorKind::Bug => Kind::Bug,
+                crate::error::ErrorKind::Other => Kind::Other,
+            },
+        }
+    }
+
+    /// Check if this error is recoverable.
+    pub fn is_recoverable(&self) -> bool {
+        match self {
+            Error::PackIngestion(err) => err.is_recoverable(),
+            Error::Io(_) | Error::Resource(_) | Error::Cancelled => true,
+            _ => false,
+        }
+    }
+
+    /// Get error recovery strategy if available.
+    pub fn recovery_strategy(&self) -> Option<crate::error::ErrorRecovery> {
+        match self {
+            Error::PackIngestion(err) => Some(crate::error::ErrorRecovery::for_error(err)),
+            _ => None,
+        }
+    }
+
+    /// Generate a user-facing error message.
+    pub fn user_message(&self) -> String {
+        match self {
+            Error::PackIngestion(err) => err.user_message(),
+            Error::Unimplemented => "This operation is not yet implemented.".to_string(),
+            Error::Protocol(msg) => format!("Protocol error: {}\n\nThis indicates a problem with the Git protocol communication. Please try again.", msg),
+            Error::Validation(msg) => format!("Validation error: {}\n\nThe operation failed validation checks. Please verify your input and try again.", msg),
+            Error::Io(err) => format!("I/O error: {}\n\nThis may indicate disk space issues, permission problems, or network connectivity issues. Please check your system resources and try again.", err),
+            Error::Resource(msg) => format!("Resource error: {}\n\nThe operation exceeded resource limits. Please contact your administrator if you need higher limits.", msg),
+            Error::Cancelled => "Operation was cancelled.\n\nThe operation was interrupted and can be safely retried.".to_string(),
+            Error::Fsck(msg) => format!("Object validation failed: {}\n\nPlease check your objects for corruption and try again.", msg),
         }
     }
 }

@@ -16,8 +16,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::{ErrorContext, PackIngestionError, Result};
+
 #[cfg(all(feature = "progress", feature = "pack-streaming"))]
 use gix_features::progress::DynNestedProgress;
+#[cfg(feature = "progress")]
+use std::time::Instant;
 
 pub use fsck::{FsckConfig, FsckLevel, FsckMessageLevel, FsckResults, FsckValidator};
 
@@ -55,6 +59,7 @@ impl IngestionPolicy {
 #[derive(Debug)]
 pub struct PackIngestor {
     /// Fsck validator for object validation
+    #[cfg_attr(not(feature = "fsck"), allow(dead_code))]
     fsck_validator: Option<FsckValidator>,
 }
 
@@ -91,7 +96,7 @@ impl PackIngestor {
 
 impl PackIngestor {
     /// Placeholder no-op for index-pack ingestion used by scaffold-only entrypoints.
-    pub fn index_pack_stub() -> Result<(), crate::Error> {
+    pub fn index_pack_stub() -> Result<()> {
         Ok(())
     }
 
@@ -109,13 +114,24 @@ impl PackIngestor {
         pack_size: Option<u64>,
         thin_pack_lookup: Option<gix_odb::Handle>,
         progress: &mut dyn gix_features::progress::DynNestedProgress,
-    ) -> Result<FsckResults, crate::Error> {
+    ) -> Result<FsckResults> {
         use gix_pack::bundle::write::Options as WriteOptions;
         use std::sync::atomic::AtomicBool;
 
+        let start_time = Instant::now();
+        let context = ErrorContext::new("unpack-objects")
+            .with_context("strategy", "unpack-objects")
+            .with_pack_size(pack_size.unwrap_or(0));
+
         // 1. Ensure pack directory exists.
         let pack_dir = quarantine_objects_dir.join("pack");
-        fs::create_dir_all(&pack_dir)?;
+        fs::create_dir_all(&pack_dir).map_err(|e| {
+            PackIngestionError::quarantine_operation(
+                "failed to create pack directory",
+                context.clone(),
+                Some(Box::new(e)),
+            )
+        })?;
 
         // 2. Write incoming stream into a temp pack in quarantine using bundle writer.
         // Note: This produces a valid .pack and .idx side by side.
@@ -134,7 +150,13 @@ impl PackIngestor {
                 Some(handle.clone()),
                 write_opts,
             )
-            .map_err(|e| crate::Error::Protocol(e.to_string()))?,
+            .map_err(|e| {
+                PackIngestionError::pack_parsing(
+                    "failed to write pack bundle with thin pack support",
+                    context.clone().with_elapsed(start_time.elapsed()),
+                    Some(Box::new(e)),
+                )
+            })?,
             None => gix_pack::Bundle::write_to_directory(
                 input,
                 Some(pack_dir.as_path()),
@@ -143,7 +165,13 @@ impl PackIngestor {
                 Option::<gix_odb::Handle>::None,
                 write_opts,
             )
-            .map_err(|e| crate::Error::Protocol(e.to_string()))?,
+            .map_err(|e| {
+                PackIngestionError::pack_parsing(
+                    "failed to write pack bundle",
+                    context.clone().with_elapsed(start_time.elapsed()),
+                    Some(Box::new(e)),
+                )
+            })?,
         };
 
         // 3. Find the freshly written .pack file in quarantine.
@@ -159,7 +187,13 @@ impl PackIngestor {
                 }
             }
         }
-        let pack_path = pack_path.ok_or_else(|| crate::Error::Protocol("failed to locate just-written pack".into()))?;
+        let pack_path = pack_path.ok_or_else(|| {
+            PackIngestionError::unpack_objects_operation(
+                "failed to locate just-written pack file",
+                context.clone().with_elapsed(start_time.elapsed()),
+                None,
+            )
+        })?;
 
         // 4. Explode pack contents into loose objects in quarantine objects_dir.
         //    Keep verification minimal here; rely on quarantine and later fsck when enabled.
@@ -181,12 +215,50 @@ impl PackIngestor {
         // 5. Perform fsck validation before removing pack artifacts
         let fsck_results = if let Some(ref validator) = self.fsck_validator {
             if let Some(ref main_odb) = thin_pack_lookup {
-                validator.validate_quarantine(quarantine_objects_dir, main_odb)?
+                validator.validate_quarantine(quarantine_objects_dir, main_odb)
+                    .map_err(|e| match e {
+                        crate::Error::Fsck(msg) => PackIngestionError::object_validation(
+                            msg,
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            None,
+                            vec![],
+                            None,
+                        ),
+                        _ => PackIngestionError::object_validation(
+                            "fsck validation failed",
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            None,
+                            vec![e.to_string()],
+                            Some(Box::new(e)),
+                        ),
+                    })?
             } else {
                 // Create a temporary ODB handle for validation if none provided
                 let temp_odb = gix_odb::at(quarantine_objects_dir)
-                    .map_err(|e| crate::Error::Validation(format!("failed to create temp ODB for fsck: {}", e)))?;
-                validator.validate_quarantine(quarantine_objects_dir, &temp_odb)?
+                    .map_err(|e| {
+                        PackIngestionError::object_database(
+                            "failed to create temp ODB for fsck",
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            Some(Box::new(e)),
+                        )
+                    })?;
+                validator.validate_quarantine(quarantine_objects_dir, &temp_odb)
+                    .map_err(|e| match e {
+                        crate::Error::Fsck(msg) => PackIngestionError::object_validation(
+                            msg,
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            None,
+                            vec![],
+                            None,
+                        ),
+                        _ => PackIngestionError::object_validation(
+                            "fsck validation failed",
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            None,
+                            vec![e.to_string()],
+                            Some(Box::new(e)),
+                        ),
+                    })?
             }
         } else {
             FsckResults {
@@ -223,8 +295,13 @@ impl PackIngestor {
         _pack_size: Option<u64>,
         _thin_pack_lookup: Option<gix_odb::Handle>,
         _progress: &mut dyn std::any::Any,
-    ) -> Result<FsckResults, crate::Error> {
-        Err(crate::Error::Unimplemented)
+    ) -> Result<FsckResults> {
+        let context = ErrorContext::new("unpack-objects")
+            .with_context("reason", "progress and pack-streaming features not enabled");
+        Err(PackIngestionError::configuration(
+            "unpack-objects requires progress and pack-streaming features",
+            context,
+        ))
     }
 }
 
@@ -244,13 +321,24 @@ impl PackIngestor {
             pack_size: Option<u64>,
             thin_pack_lookup: Option<gix_odb::Handle>,
             progress: &mut dyn gix_features::progress::DynNestedProgress,
-        ) -> Result<FsckResults, crate::Error> {
+        ) -> Result<FsckResults> {
         use gix_pack::bundle::write::{Options, Outcome};
         use std::sync::atomic::AtomicBool;
 
+        let start_time = Instant::now();
+        let context = ErrorContext::new("index-pack")
+            .with_context("strategy", "index-pack")
+            .with_pack_size(pack_size.unwrap_or(0));
+
         // gix-pack expects the 'objects/pack' directory as target.
         let pack_dir = quarantine_objects_dir.join("pack");
-        fs::create_dir_all(&pack_dir)?;
+        fs::create_dir_all(&pack_dir).map_err(|e| {
+            PackIngestionError::quarantine_operation(
+                "failed to create pack directory",
+                context.clone(),
+                Some(Box::new(e)),
+            )
+        })?;
 
         let should_interrupt = AtomicBool::new(false);
 
@@ -270,7 +358,13 @@ impl PackIngestor {
                     Some(handle.clone()),
                     options,
                 )
-                .map_err(|e| crate::Error::Protocol(e.to_string()))?
+                .map_err(|e| {
+                    PackIngestionError::index_pack_operation(
+                        "failed to write pack bundle with thin pack support",
+                        context.clone().with_elapsed(start_time.elapsed()),
+                        Some(Box::new(e)),
+                    )
+                })?
             }
             None => {
                 gix_pack::Bundle::write_to_directory(
@@ -281,19 +375,63 @@ impl PackIngestor {
                     Option::<gix_odb::Handle>::None,
                     options,
                 )
-                .map_err(|e| crate::Error::Protocol(e.to_string()))?
+                .map_err(|e| {
+                    PackIngestionError::index_pack_operation(
+                        "failed to write pack bundle",
+                        context.clone().with_elapsed(start_time.elapsed()),
+                        Some(Box::new(e)),
+                    )
+                })?
             }
         };
 
         // Perform fsck validation if configured
         let fsck_results = if let Some(ref validator) = self.fsck_validator {
             if let Some(ref main_odb) = thin_pack_lookup {
-                validator.validate_quarantine(quarantine_objects_dir, main_odb)?
+                validator.validate_quarantine(quarantine_objects_dir, main_odb)
+                    .map_err(|e| match e {
+                        crate::Error::Fsck(msg) => PackIngestionError::object_validation(
+                            msg,
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            None,
+                            vec![],
+                            None,
+                        ),
+                        _ => PackIngestionError::object_validation(
+                            "fsck validation failed",
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            None,
+                            vec![e.to_string()],
+                            Some(Box::new(e)),
+                        ),
+                    })?
             } else {
                 // Create a temporary ODB handle for validation if none provided
                 let temp_odb = gix_odb::at(quarantine_objects_dir)
-                    .map_err(|e| crate::Error::Validation(format!("failed to create temp ODB for fsck: {}", e)))?;
-                validator.validate_quarantine(quarantine_objects_dir, &temp_odb)?
+                    .map_err(|e| {
+                        PackIngestionError::object_database(
+                            "failed to create temp ODB for fsck",
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            Some(Box::new(e)),
+                        )
+                    })?;
+                validator.validate_quarantine(quarantine_objects_dir, &temp_odb)
+                    .map_err(|e| match e {
+                        crate::Error::Fsck(msg) => PackIngestionError::object_validation(
+                            msg,
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            None,
+                            vec![],
+                            None,
+                        ),
+                        _ => PackIngestionError::object_validation(
+                            "fsck validation failed",
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            None,
+                            vec![e.to_string()],
+                            Some(Box::new(e)),
+                        ),
+                    })?
             }
         } else {
             FsckResults {
@@ -357,35 +495,80 @@ impl Quarantine {
     /// Activate the quarantine environment:
     /// - Creates the quarantine objects directory with 'info' and 'pack' subdirectories.
     /// - Writes 'info/alternates' to point to the main objects directory.
-    pub fn activate(&mut self) -> Result<(), crate::Error> {
+    pub fn activate(&mut self) -> Result<()> {
+        let context = ErrorContext::new("quarantine-activate")
+            .with_context("quarantine_dir", self.objects_dir.display().to_string())
+            .with_context("main_objects_dir", self.main_objects_dir.display().to_string());
+
         // directories
-        fs::create_dir_all(self.objects_dir.join("info"))?;
-        fs::create_dir_all(self.objects_dir.join("pack"))?;
+        fs::create_dir_all(self.objects_dir.join("info")).map_err(|e| {
+            PackIngestionError::quarantine_operation(
+                "failed to create quarantine info directory",
+                context.clone(),
+                Some(Box::new(e)),
+            )
+        })?;
+        fs::create_dir_all(self.objects_dir.join("pack")).map_err(|e| {
+            PackIngestionError::quarantine_operation(
+                "failed to create quarantine pack directory",
+                context.clone(),
+                Some(Box::new(e)),
+            )
+        })?;
 
         // 'info/alternates' must contain the path to the main objects directory, one per line.
         {
-        let mut line = self.main_objects_dir.display().to_string();
-        if !line.ends_with('\n') {
-            line.push('\n');
+            let mut line = self.main_objects_dir.display().to_string();
+            if !line.ends_with('\n') {
+                line.push('\n');
+            }
+            fs::write(&self.alternates_file, line.as_bytes()).map_err(|e| {
+                PackIngestionError::quarantine_operation(
+                    "failed to write alternates file",
+                    context.clone(),
+                    Some(Box::new(e)),
+                )
+            })?;
         }
-        fs::write(&self.alternates_file, line.as_bytes())?;
-    }
         self.active = true;
         Ok(())
     }
 
     /// Migrate quarantined packs into the main objects/pack directory and clean up quarantine.
-    pub fn migrate_on_success(&mut self) -> Result<(), crate::Error> {
+    pub fn migrate_on_success(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
+
+        let context = ErrorContext::new("quarantine-migrate")
+            .with_context("src_pack", self.objects_dir.join("pack").display().to_string())
+            .with_context("dst_pack", self.main_objects_dir.join("pack").display().to_string());
+
         let src_pack = self.objects_dir.join("pack");
         let dst_pack = self.main_objects_dir.join("pack");
-        fs::create_dir_all(&dst_pack)?;
+        fs::create_dir_all(&dst_pack).map_err(|e| {
+            PackIngestionError::quarantine_operation(
+                "failed to create destination pack directory",
+                context.clone(),
+                Some(Box::new(e)),
+            )
+        })?;
 
         if src_pack.is_dir() {
-            for entry in fs::read_dir(&src_pack)? {
-                let entry = entry?;
+            for entry in fs::read_dir(&src_pack).map_err(|e| {
+                PackIngestionError::quarantine_operation(
+                    "failed to read source pack directory",
+                    context.clone(),
+                    Some(Box::new(e)),
+                )
+            })? {
+                let entry = entry.map_err(|e| {
+                    PackIngestionError::quarantine_operation(
+                        "failed to read pack directory entry",
+                        context.clone(),
+                        Some(Box::new(e)),
+                    )
+                })?;
                 let path = entry.path();
                 if let Some(name) = path.file_name() {
                     // Only move pack artifacts: pack-*.pack, pack-*.idx, pack-*.keep
@@ -396,8 +579,20 @@ impl Quarantine {
                         match fs::rename(&path, &dst) {
                             Ok(_) => {}
                             Err(_) => {
-                                fs::copy(&path, &dst)?;
-                                fs::remove_file(&path)?;
+                                fs::copy(&path, &dst).map_err(|e| {
+                                    PackIngestionError::quarantine_operation(
+                                        format!("failed to copy pack file {}", name_s),
+                                        context.clone(),
+                                        Some(Box::new(e)),
+                                    )
+                                })?;
+                                fs::remove_file(&path).map_err(|e| {
+                                    PackIngestionError::quarantine_operation(
+                                        format!("failed to remove source pack file {}", name_s),
+                                        context.clone(),
+                                        Some(Box::new(e)),
+                                    )
+                                })?;
                             }
                         }
                     }
@@ -418,7 +613,7 @@ impl Quarantine {
     }
 
     /// Drop quarantined content on failure and clean up on disk.
-    pub fn drop_on_failure(&mut self) -> Result<(), crate::Error> {
+    pub fn drop_on_failure(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
