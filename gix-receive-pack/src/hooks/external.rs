@@ -543,7 +543,7 @@ mod tests {
         assert!(!decision.allowed);
         assert_eq!(decision.exit_code, Some(1));
         assert_eq!(decision.stderr, b"Hook error");
-        assert!(decision.message.contains("Hook 'test-hook' failed"));
+        assert!(decision.message.contains("hook test-hook failed"));
     }
 
     #[test]

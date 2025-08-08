@@ -21,7 +21,7 @@ use crate::Error;
 /// use gix_receive_pack::protocol::CommandUpdate;
 /// use gix_hash::ObjectId;
 ///
-/// let hooks = NoopHooks::new();
+/// let mut hooks = NoopHooks::new();
 /// let command = CommandUpdate::Create {
 ///     new: ObjectId::null(gix_hash::Kind::Sha1),
 ///     name: "refs/heads/main".to_string(),
