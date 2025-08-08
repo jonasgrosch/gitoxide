@@ -106,6 +106,17 @@ pub mod interrupt;
 // M4: Shallow planning and connectivity checking.
 pub mod shallow;
 pub mod connectivity;
+// M5: Policy evaluation and enforcement.
+pub mod policy;
+// M5: Hook execution framework.
+pub mod hooks;
+
+// M5: Proc-receive protocol handler.
+pub mod proc_receive;
+// M5: Configuration parsing for policies, hooks, and proc-receive.
+pub mod config;
+// M6: Reference transaction planning and execution.
+pub mod refs;
 
 pub use protocol::{
     Advertiser, AdvertisementConfig, CapabilityOrdering, CapabilitySet, CommandList, CommandUpdate, HiddenRefPredicate, Options, RefRecord, setup_advertiser_with_config,
@@ -114,6 +125,21 @@ pub use interrupt::{CancellationFlag, CancellationPoint};
 // M4: Re-exports for new modules
 pub use shallow::ShallowPlan;
 pub use connectivity::{ConnectivityChecker, DefaultConnectivityChecker};
+// M5: Re-exports for policy module
+pub use policy::{PolicySet, PolicyDecision, ReasonCode, UpdateInstead};
+// M5: Re-exports for hooks module
+pub use hooks::{Hooks, HookDecision, NoopHooks};
+#[cfg(feature = "hooks-external")]
+pub use hooks::{ExternalHooks, env::{HookEnvironment, Identity}};
+// M5: Re-exports for config module
+pub use config::{PolicyConfig, HookConfig, ProcReceiveConfig, load_all_config};
+// M6: Re-exports for refs module
+pub use refs::{
+    TransactionPlanner, PlannedCommand, TransactionPlan, PhaseType, TransactionMode,
+    AtomicExecutor, NonAtomicExecutor, CommandResult, TransactionResult,
+    ConflictDetector, Conflict, ConflictType,
+    SymrefResolver, AliasValidator, TransactionError
+};
 
 use core::marker::PhantomData;
 use std::path::PathBuf;
@@ -195,6 +221,120 @@ impl Error {
                 crate::error::ErrorKind::Other => Kind::Other,
             },
         }
+    }
+
+    /// Create a policy violation error with refname and reason.
+    ///
+    /// Maps policy violations to Validation errors with clear messages
+    /// that include refname and reason for M7 reporting.
+    pub fn policy_violation(reason: &str, refname: &str) -> Self {
+        Error::Validation(format!("policy: {}: {}", reason, refname))
+    }
+
+    /// Create a policy violation error with refname, reason, and OIDs.
+    ///
+    /// Enhanced version that includes old and new OIDs for detailed reporting.
+    pub fn policy_violation_with_oids(
+        reason: &str, 
+        refname: &str, 
+        old_oid: Option<gix_hash::ObjectId>, 
+        new_oid: Option<gix_hash::ObjectId>
+    ) -> Self {
+        let oid_info = match (old_oid, new_oid) {
+            (Some(old), Some(new)) => format!(" ({}..{})", old, new),
+            (Some(old), None) => format!(" (delete {})", old),
+            (None, Some(new)) => format!(" (create {})", new),
+            (None, None) => String::new(),
+        };
+        Error::Validation(format!("policy: {}: {}{}", reason, refname, oid_info))
+    }
+
+    /// Create a hook failure error with hook name and exit code.
+    ///
+    /// Maps hook exit != 0 to Validation errors with contextual information.
+    pub fn hook_failed(hook_name: &str, exit_code: i32, refname: Option<&str>) -> Self {
+        let ref_info = refname.map(|r| format!(" for {}", r)).unwrap_or_default();
+        Error::Validation(format!("hook {} failed (code {}){}", hook_name, exit_code, ref_info))
+    }
+
+    /// Create a hook failure error with hook name, exit code, and stderr output.
+    ///
+    /// Enhanced version that includes stderr output for detailed diagnostics.
+    pub fn hook_failed_with_output(
+        hook_name: &str, 
+        exit_code: i32, 
+        stderr: &[u8], 
+        refname: Option<&str>
+    ) -> Self {
+        let ref_info = refname.map(|r| format!(" for {}", r)).unwrap_or_default();
+        let stderr_sample = if stderr.is_empty() {
+            String::new()
+        } else {
+            let stderr_str = String::from_utf8_lossy(stderr);
+            let truncated = if stderr_str.len() > 200 {
+                format!("{}...", &stderr_str[..200])
+            } else {
+                stderr_str.to_string()
+            };
+            format!(": {}", truncated)
+        };
+        Error::Validation(format!(
+            "hook {} failed (code {}){}{}", 
+            hook_name, exit_code, ref_info, stderr_sample
+        ))
+    }
+
+    /// Create a hook timeout error.
+    ///
+    /// Maps hook timeouts to Resource errors with timeout information.
+    pub fn hook_timeout(hook_name: &str, timeout_secs: u64, refname: Option<&str>) -> Self {
+        let ref_info = refname.map(|r| format!(" for {}", r)).unwrap_or_default();
+        Error::Resource(format!(
+            "hook {} timeout after {}s{}", 
+            hook_name, timeout_secs, ref_info
+        ))
+    }
+
+    /// Create a hook output limit exceeded error.
+    ///
+    /// Maps hook output size limit violations to Resource errors.
+    pub fn hook_output_exceeded(hook_name: &str, limit_bytes: usize, refname: Option<&str>) -> Self {
+        let ref_info = refname.map(|r| format!(" for {}", r)).unwrap_or_default();
+        Error::Resource(format!(
+            "hook {} output exceeded {} bytes{}", 
+            hook_name, limit_bytes, ref_info
+        ))
+    }
+
+    /// Create a proc-receive negotiation error.
+    ///
+    /// Maps proc-receive negotiation failures to Protocol errors.
+    pub fn proc_receive_negotiation(reason: &str) -> Self {
+        Error::Protocol(format!("proc-receive negotiation failed: {}", reason))
+    }
+
+    /// Create a proc-receive version mismatch error.
+    ///
+    /// Maps version mismatches to Protocol errors with expected/actual versions.
+    pub fn proc_receive_version_mismatch(expected: u32, actual: u32) -> Self {
+        Error::Protocol(format!(
+            "proc-receive version mismatch: expected {}, got {}", 
+            expected, actual
+        ))
+    }
+
+    /// Create a proc-receive helper rejection error.
+    ///
+    /// Maps proc-receive "ng" responses to Validation errors with refname context.
+    pub fn proc_receive_rejected(reason: &str, refname: &str) -> Self {
+        Error::Validation(format!("proc-receive rejected {}: {}", refname, reason))
+    }
+
+    /// Create an environment setup error.
+    ///
+    /// Maps missing or invalid environment variables to Validation errors.
+    pub fn environment_setup(reason: &str) -> Self {
+        Error::Validation(format!("environment setup failed: {}", reason))
     }
 
     /// Check if this error is recoverable.
