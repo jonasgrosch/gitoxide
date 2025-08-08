@@ -56,7 +56,9 @@ gix-config = { path = "../gix-config", default-features = false }
 gix-hash = { path = "../gix-hash", default-features = false }
 gix-features = { path = "../gix-features", default-features = false, optional = true }
 gix-trace = { path = "../gix-trace", default-features = false, optional = true }
+gix-tempfile = { path = "../gix-tempfile", default-features = false }
 
 [dev-dependencies]
 anyhow = "1"
 pretty_assertions = "1"
+gix-testtools = { path = "../tests/tools" }
