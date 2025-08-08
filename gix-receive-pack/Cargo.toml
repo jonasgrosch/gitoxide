@@ -1,0 +1,43 @@
+[package]
+name = "gix-receive-pack"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GitoxideLabs/gitoxide"
+description = "Spec-first, minimal receive-pack implementation scaffold for gitoxide with typestate builder."
+keywords = ["git", "receive-pack", "push", "protocol"]
+categories = ["development-tools", "network-programming"]
+
+[features]
+default = ["blocking"]
+blocking = []
+async = ["dep:tokio", "gix-transport/async-client", "gix-packetline/async-io"]
+strict-compat = []
+
+[dependencies]
+thiserror = "1"
+
+# Async (guarded)
+tokio = { version = "1", default-features = false, features = ["io-util", "macros"], optional = true }
+
+# Core gitoxide crates (path-based; use minimal default-features for compile-time hygiene)
+gix-protocol = { path = "../gix-protocol", default-features = false }
+gix-transport = { path = "../gix-transport", default-features = false }
+gix-packetline = { path = "../gix-packetline", default-features = false }
+gix-packetline-blocking = { path = "../gix-packetline-blocking", default-features = false }
+gix-pack = { path = "../gix-pack", default-features = false }
+gix-odb = { path = "../gix-odb", default-features = false }
+gix-ref = { path = "../gix-ref", default-features = false }
+gix-shallow = { path = "../gix-shallow", default-features = false }
+gix-fsck = { path = "../gix-fsck", default-features = false }
+gix-object = { path = "../gix-object", default-features = false }
+gix-command = { path = "../gix-command", default-features = false }
+gix-worktree = { path = "../gix-worktree", default-features = false }
+gix-index = { path = "../gix-index", default-features = false }
+gix-diff = { path = "../gix-diff", default-features = false }
+gix-config = { path = "../gix-config", default-features = false }
+gix-hash = { path = "../gix-hash", default-features = false }
+
+[dev-dependencies]
+anyhow = "1"
+pretty_assertions = "1"
