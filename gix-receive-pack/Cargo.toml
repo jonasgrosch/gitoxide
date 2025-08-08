@@ -19,7 +19,9 @@ async-io = ["dep:tokio", "gix-transport/async-client", "gix-packetline/async-io"
 
 # Cross-cutting features (scaffolded; wired into deps conservatively)
 parallel = ["dep:gix-features", "gix-features/parallel"]
-progress = ["dep:gix-features", "gix-features/progress"]
+progress = ["dep:gix-features", "gix-features/progress", "pack-streaming"]
+# Enable gix-pack's streaming bundle writer used for pack ingestion
+pack-streaming = ["gix-pack/streaming-input"]
 hooks-external = ["dep:gix-command"]
 fsck = ["dep:gix-fsck"]
 strict-compat = []
