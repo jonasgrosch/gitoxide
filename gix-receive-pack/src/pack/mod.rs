@@ -19,8 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{ErrorContext, PackIngestionError, Result};
 
-#[cfg(all(feature = "progress", feature = "pack-streaming"))]
-use gix_features::progress::DynNestedProgress;
+
 #[cfg(feature = "progress")]
 use std::time::Instant;
 
@@ -28,6 +27,35 @@ pub use fsck::{FsckConfig, FsckLevel, FsckMessageLevel, FsckResults, FsckValidat
 pub use streaming::{
     BufferPool, MemoryStats, MemoryTracker, StreamingBufReader, StreamingConfig, StreamingPackReader, StreamingStats,
 };
+
+/// CountingReader is only used in streaming pack operations
+#[cfg(all(feature = "progress", feature = "pack-streaming"))]
+#[derive(Debug)]
+struct CountingReader<R: std::io::BufRead> {
+    inner: R,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(all(feature = "progress", feature = "pack-streaming"))]
+impl<R: std::io::BufRead> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.counter
+            .fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(n)
+    }
+}
+
+#[cfg(all(feature = "progress", feature = "pack-streaming"))]
+impl<R: std::io::BufRead> std::io::BufRead for CountingReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt)
+    }
+}
 
 /// Which path to use to ingest an incoming pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +71,27 @@ pub enum PackIngestPath {
 pub struct IngestionPolicy {
     /// transfer.unpackLimit: object-count threshold for unpack-objects.
     pub unpack_limit: Option<u64>,
+    /// Whether to enable fallback strategies when primary strategy fails.
+    pub enable_fallback: bool,
 }
 
 impl IngestionPolicy {
+    /// Create a new ingestion policy with fallback enabled.
+    pub fn with_fallback(unpack_limit: Option<u64>) -> Self {
+        Self {
+            unpack_limit,
+            enable_fallback: true,
+        }
+    }
+
+    /// Create a new ingestion policy with fallback disabled.
+    pub fn without_fallback(unpack_limit: Option<u64>) -> Self {
+        Self {
+            unpack_limit,
+            enable_fallback: false,
+        }
+    }
+
     /// Choose an ingestion path using the optional object-count hint and the configured unpack limit.
     ///
     /// Rules:
@@ -56,6 +102,37 @@ impl IngestionPolicy {
             (Some(limit), Some(count)) if count <= limit => PackIngestPath::UnpackObjects,
             _ => PackIngestPath::IndexPack,
         }
+    }
+
+    /// Get the fallback strategy for a failed ingestion attempt.
+    ///
+    /// Returns None if fallback is disabled or no fallback is available.
+    pub fn get_fallback_strategy(&self, failed_strategy: PackIngestPath) -> Option<PackIngestPath> {
+        if !self.enable_fallback {
+            return None;
+        }
+
+        match failed_strategy {
+            PackIngestPath::IndexPack => Some(PackIngestPath::UnpackObjects),
+            PackIngestPath::UnpackObjects => Some(PackIngestPath::IndexPack),
+        }
+    }
+
+    /// Check if fallback is available for the given strategy.
+    pub fn has_fallback(&self, strategy: PackIngestPath) -> bool {
+        self.enable_fallback && self.get_fallback_strategy(strategy).is_some()
+    }
+
+    /// Get all available strategies in order of preference.
+    pub fn get_strategy_sequence(&self, object_count_hint: Option<u64>) -> Vec<PackIngestPath> {
+        let primary = self.choose_path(object_count_hint);
+        let mut strategies = vec![primary];
+        
+        if let Some(fallback) = self.get_fallback_strategy(primary) {
+            strategies.push(fallback);
+        }
+        
+        strategies
     }
 }
 
@@ -120,6 +197,298 @@ impl PackIngestor {
     pub fn set_streaming_config(&mut self, config: StreamingConfig) {
         self.streaming_config = config;
     }
+}
+
+/// Pack ingestion controller that handles strategy selection and fallback logic.
+#[derive(Debug)]
+pub struct PackIngestionController {
+    /// The pack ingestor instance
+    ingestor: PackIngestor,
+    /// Ingestion policy for strategy selection
+    policy: IngestionPolicy,
+    /// Maximum number of fallback attempts
+    pub max_fallback_attempts: u32,
+}
+
+impl PackIngestionController {
+    /// Create a new pack ingestion controller.
+    pub fn new(ingestor: PackIngestor, policy: IngestionPolicy) -> Self {
+        Self {
+            ingestor,
+            policy,
+            max_fallback_attempts: 2, // Primary + 1 fallback by default
+        }
+    }
+
+    /// Create a controller with custom fallback attempt limit.
+    pub fn with_max_fallback_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_fallback_attempts = max_attempts;
+        self
+    }
+
+    /// Ingest a pack with automatic fallback on failure.
+    #[cfg(feature = "progress")]
+    pub fn ingest_pack_with_fallback(
+        &self,
+        input: &mut dyn std::io::BufRead,
+        quarantine_objects_dir: &std::path::Path,
+        pack_size: Option<u64>,
+        object_count_hint: Option<u64>,
+        thin_pack_lookup: Option<gix_odb::Handle>,
+        progress: &mut dyn gix_features::progress::DynNestedProgress,
+    ) -> Result<PackIngestionResult> {
+        let strategies = self.policy.get_strategy_sequence(object_count_hint);
+        let mut last_error: Option<PackIngestionError> = None;
+        let mut attempt_count = 0;
+
+        for (strategy_index, strategy) in strategies.iter().enumerate() {
+            if attempt_count >= self.max_fallback_attempts {
+                break;
+            }
+
+            let context = ErrorContext::new("pack-ingestion-with-fallback")
+                .with_context("strategy", format!("{:?}", strategy))
+                .with_context("attempt", (attempt_count + 1).to_string())
+                .with_context("is_fallback", if strategy_index > 0 { "true" } else { "false" })
+                .with_pack_size(pack_size.unwrap_or(0));
+
+            // Create a progress child for this attempt
+            let mut strategy_progress = progress.add_child(format!("attempt {} ({:?})", attempt_count + 1, strategy));
+
+            let result = match strategy {
+                PackIngestPath::IndexPack => {
+                    self.ingestor.index_pack(
+                        input,
+                        quarantine_objects_dir,
+                        pack_size,
+                        thin_pack_lookup.clone(),
+                        &mut strategy_progress,
+                    )
+                }
+                PackIngestPath::UnpackObjects => {
+                    self.ingestor.unpack_objects(
+                        input,
+                        quarantine_objects_dir,
+                        pack_size,
+                        thin_pack_lookup.clone(),
+                        &mut strategy_progress,
+                    )
+                }
+            };
+
+            match result {
+                Ok(fsck_results) => {
+                    return Ok(PackIngestionResult {
+                        strategy_used: *strategy,
+                        fsck_results,
+                        attempts_made: attempt_count + 1,
+                        fallback_used: strategy_index > 0,
+                        errors_encountered: if let Some(err) = last_error {
+                            vec![err]
+                        } else {
+                            vec![]
+                        },
+                    });
+                }
+                Err(error) => {
+                    // Check if this error is recoverable and we should try fallback
+                    if self.should_attempt_fallback(&error, strategy_index, attempt_count) {
+                        last_error = Some(error);
+                        attempt_count += 1;
+                        continue;
+                    } else {
+                        // Error is not recoverable or we've exhausted attempts
+                        return Err(self.create_fallback_error(error, last_error, attempt_count + 1, context));
+                    }
+                }
+            }
+        }
+
+        // If we get here, we've exhausted all strategies
+        let final_error = last_error.unwrap_or_else(|| {
+            PackIngestionError::configuration(
+                "no ingestion strategies available",
+                ErrorContext::new("pack-ingestion-with-fallback")
+                    .with_context("strategies_tried", strategies.len().to_string()),
+            )
+        });
+
+        Err(self.create_fallback_error(final_error, None, attempt_count, ErrorContext::new("pack-ingestion-with-fallback")))
+    }
+
+    /// Ingest a pack with streaming and fallback support.
+    #[cfg(all(feature = "progress", feature = "pack-streaming"))]
+    pub fn ingest_pack_streaming_with_fallback(
+        &self,
+        input: &mut dyn std::io::BufRead,
+        quarantine_objects_dir: &std::path::Path,
+        pack_size: Option<u64>,
+        object_count_hint: Option<u64>,
+        thin_pack_lookup: Option<gix_odb::Handle>,
+        progress: &mut dyn gix_features::progress::DynNestedProgress,
+    ) -> Result<PackIngestionStreamingResult> {
+        let strategies = self.policy.get_strategy_sequence(object_count_hint);
+        let mut last_error: Option<PackIngestionError> = None;
+        let mut attempt_count = 0;
+
+        for (strategy_index, strategy) in strategies.iter().enumerate() {
+            if attempt_count >= self.max_fallback_attempts {
+                break;
+            }
+
+            let context = ErrorContext::new("pack-ingestion-streaming-with-fallback")
+                .with_context("strategy", format!("{:?}", strategy))
+                .with_context("attempt", (attempt_count + 1).to_string())
+                .with_context("is_fallback", if strategy_index > 0 { "true" } else { "false" })
+                .with_pack_size(pack_size.unwrap_or(0));
+
+            let mut strategy_progress = progress.add_child(format!("attempt {} ({:?})", attempt_count + 1, strategy));
+
+            let result = match strategy {
+                PackIngestPath::IndexPack => {
+                    self.ingestor.index_pack_streaming(
+                        input,
+                        quarantine_objects_dir,
+                        pack_size,
+                        thin_pack_lookup.clone(),
+                        &mut strategy_progress,
+                    )
+                }
+                PackIngestPath::UnpackObjects => {
+                    self.ingestor.unpack_objects_streaming(
+                        input,
+                        quarantine_objects_dir,
+                        pack_size,
+                        thin_pack_lookup.clone(),
+                        &mut strategy_progress,
+                    )
+                }
+            };
+
+            match result {
+                Ok((fsck_results, streaming_stats)) => {
+                    return Ok(PackIngestionStreamingResult {
+                        strategy_used: *strategy,
+                        fsck_results,
+                        streaming_stats,
+                        attempts_made: attempt_count + 1,
+                        fallback_used: strategy_index > 0,
+                        errors_encountered: if let Some(err) = last_error {
+                            vec![err]
+                        } else {
+                            vec![]
+                        },
+                    });
+                }
+                Err(error) => {
+                    if self.should_attempt_fallback(&error, strategy_index, attempt_count) {
+                        last_error = Some(error);
+                        attempt_count += 1;
+                        continue;
+                    } else {
+                        return Err(self.create_fallback_error(error, last_error, attempt_count + 1, context));
+                    }
+                }
+            }
+        }
+
+        let final_error = last_error.unwrap_or_else(|| {
+            PackIngestionError::configuration(
+                "no ingestion strategies available",
+                ErrorContext::new("pack-ingestion-streaming-with-fallback")
+                    .with_context("strategies_tried", strategies.len().to_string()),
+            )
+        });
+
+        Err(self.create_fallback_error(final_error, None, attempt_count, ErrorContext::new("pack-ingestion-streaming-with-fallback")))
+    }
+
+    /// Determine if we should attempt fallback for the given error.
+    pub fn should_attempt_fallback(&self, error: &PackIngestionError, strategy_index: usize, attempt_count: u32) -> bool {
+        // Don't attempt fallback if it's disabled
+        if !self.policy.enable_fallback {
+            return false;
+        }
+
+        // Don't attempt fallback if we've exceeded max attempts
+        if attempt_count >= self.max_fallback_attempts - 1 {
+            return false;
+        }
+
+        // Don't attempt fallback if this is already a fallback attempt and we have no more strategies
+        if strategy_index >= 1 {
+            return false;
+        }
+
+        // Check if the error is recoverable
+        error.is_recoverable()
+    }
+
+    /// Create a comprehensive fallback error with context.
+    /// Only used by fallback methods that require the progress feature.
+    #[cfg(feature = "progress")]
+    fn create_fallback_error(
+        &self,
+        primary_error: PackIngestionError,
+        previous_error: Option<PackIngestionError>,
+        attempts_made: u32,
+        context: ErrorContext,
+    ) -> PackIngestionError {
+        let mut errors = vec![primary_error];
+        if let Some(prev) = previous_error {
+            errors.insert(0, prev);
+        }
+
+        PackIngestionError::Multiple {
+            errors,
+            context: context
+                .with_context("fallback_enabled", self.policy.enable_fallback.to_string())
+                .with_context("attempts_made", attempts_made.to_string())
+                .with_context("max_attempts", self.max_fallback_attempts.to_string()),
+        }
+    }
+
+    /// Get the ingestion policy.
+    pub fn policy(&self) -> &IngestionPolicy {
+        &self.policy
+    }
+
+    /// Get the pack ingestor.
+    pub fn ingestor(&self) -> &PackIngestor {
+        &self.ingestor
+    }
+}
+
+/// Result of pack ingestion with fallback information.
+#[derive(Debug)]
+pub struct PackIngestionResult {
+    /// The strategy that was successfully used
+    pub strategy_used: PackIngestPath,
+    /// Results from fsck validation
+    pub fsck_results: FsckResults,
+    /// Number of attempts made (including fallbacks)
+    pub attempts_made: u32,
+    /// Whether fallback was used
+    pub fallback_used: bool,
+    /// Errors encountered during failed attempts
+    pub errors_encountered: Vec<PackIngestionError>,
+}
+
+/// Result of streaming pack ingestion with fallback information.
+#[derive(Debug)]
+pub struct PackIngestionStreamingResult {
+    /// The strategy that was successfully used
+    pub strategy_used: PackIngestPath,
+    /// Results from fsck validation
+    pub fsck_results: FsckResults,
+    /// Streaming statistics
+    pub streaming_stats: StreamingStats,
+    /// Number of attempts made (including fallbacks)
+    pub attempts_made: u32,
+    /// Whether fallback was used
+    pub fallback_used: bool,
+    /// Errors encountered during failed attempts
+    pub errors_encountered: Vec<PackIngestionError>,
 }
 
 impl PackIngestor {
@@ -215,7 +584,7 @@ impl PackIngestor {
                 }
             }
         }
-        let pack_path = pack_path.ok_or_else(|| {
+        let _pack_path = pack_path.ok_or_else(|| {
             PackIngestionError::unpack_objects_operation(
                 "failed to locate just-written pack file",
                 context.clone().with_elapsed(start_time.elapsed()),
@@ -225,13 +594,13 @@ impl PackIngestor {
 
         // 4. Explode pack contents into loose objects in quarantine objects_dir.
         //    Keep verification minimal here; rely on quarantine and later fsck when enabled.
-        let mut explode_progress = progress.add_child("explode pack".to_string());
+        let _explode_progress = progress.add_child("explode pack".to_string());
         // Reuse gitoxide-core explode semantics if available directly through gix APIs.
         // The explode operation in gitoxide-core maps to gix APIs, so we replicate the essence:
         // - Open the pack and stream objects into loose::Store.
         // - Use default safety checks.
         let object_hash = gix_hash::Kind::Sha1; // TODO: detect repo hash kind in config once wired.
-        let loose = gix_odb::loose::Store::at(quarantine_objects_dir, object_hash);
+        let _loose = gix_odb::loose::Store::at(quarantine_objects_dir, object_hash);
 
         // For now, skip the pack explosion step as it requires more complex pack streaming
         // In a full implementation, we would:
@@ -239,6 +608,7 @@ impl PackIngestor {
         // 2. Decode each entry and write it as a loose object
         // 3. Update progress as we go
         // This is a placeholder that allows the fsck integration to work
+        // TODO: implement this!!!
 
         // 5. Perform fsck validation before removing pack artifacts
         let fsck_results = if let Some(ref validator) = self.fsck_validator {
@@ -477,7 +847,7 @@ impl PackIngestor {
     ///
     /// This method uses a streaming reader to process pack data with controlled memory usage,
     /// providing progress updates and memory pressure handling.
-    #[cfg(feature = "progress")]
+    #[cfg(all(feature = "pack-streaming", feature = "progress"))]
     pub fn index_pack_streaming(
         &self,
         input: &mut dyn std::io::BufRead,
@@ -495,9 +865,9 @@ impl PackIngestor {
             .with_pack_size(pack_size.unwrap_or(0));
 
         // Create streaming reader with memory management
-        let mut streaming_reader = StreamingPackReader::new(input, self.streaming_config.clone());
+        let streaming_reader = StreamingPackReader::new(input, self.streaming_config.clone());
         let memory_tracker = streaming_reader.memory_tracker();
-        let cancellation_flag = streaming_reader.cancellation_flag();
+        let _cancellation_flag = streaming_reader.cancellation_flag();
 
         // Create pack directory
         let pack_dir = quarantine_objects_dir.join("pack");
@@ -518,6 +888,8 @@ impl PackIngestor {
 
         // Create a streaming wrapper that implements BufRead
         let streaming_wrapper = StreamingBufReader::new(streaming_reader, buffer_pool.clone());
+        // Counting counter to measure exact bytes read by gix-pack writer
+        let bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let should_interrupt = AtomicBool::new(false);
         let options = Options {
@@ -527,46 +899,49 @@ impl PackIngestor {
         // Add progress child for pack writing
         let mut pack_progress = progress.add_child("writing pack".to_string());
 
-        let _out: Outcome = match &thin_pack_lookup {
-            Some(handle) => {
-                gix_pack::Bundle::write_to_directory(
-                    streaming_wrapper,
-                    Some(pack_dir.as_path()),
-                    &mut pack_progress,
-                    &should_interrupt,
-                    Some(handle.clone()),
-                    options,
-                )
-                .map_err(|e| {
-                    PackIngestionError::index_pack_operation(
-                        "failed to write pack bundle with thin pack support (streaming)",
-                        context.clone().with_elapsed(start_time.elapsed()),
-                        Some(Box::new(e)),
+        let _out: Outcome = {
+            let mut counting_reader = CountingReader { inner: streaming_wrapper, counter: bytes_counter.clone() };
+            match &thin_pack_lookup {
+                Some(handle) => {
+                    gix_pack::Bundle::write_to_directory(
+                        &mut counting_reader,
+                        Some(pack_dir.as_path()),
+                        &mut pack_progress,
+                        &should_interrupt,
+                        Some(handle.clone()),
+                        options,
                     )
-                })?
-            }
-            None => {
-                gix_pack::Bundle::write_to_directory(
-                    streaming_wrapper,
-                    Some(pack_dir.as_path()),
-                    &mut pack_progress,
-                    &should_interrupt,
-                    Option::<gix_odb::Handle>::None,
-                    options,
-                )
-                .map_err(|e| {
-                    PackIngestionError::index_pack_operation(
-                        "failed to write pack bundle (streaming)",
-                        context.clone().with_elapsed(start_time.elapsed()),
-                        Some(Box::new(e)),
+                    .map_err(|e| {
+                        PackIngestionError::index_pack_operation(
+                            "failed to write pack bundle with thin pack support (streaming)",
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            Some(Box::new(e)),
+                        )
+                    })?
+                }
+                None => {
+                    gix_pack::Bundle::write_to_directory(
+                        &mut counting_reader,
+                        Some(pack_dir.as_path()),
+                        &mut pack_progress,
+                        &should_interrupt,
+                        Option::<gix_odb::Handle>::None,
+                        options,
                     )
-                })?
+                    .map_err(|e| {
+                        PackIngestionError::index_pack_operation(
+                            "failed to write pack bundle (streaming)",
+                            context.clone().with_elapsed(start_time.elapsed()),
+                            Some(Box::new(e)),
+                        )
+                    })?
+                }
             }
         };
 
         // Get streaming statistics
         let streaming_stats = StreamingStats {
-            bytes_read: memory_tracker.current_usage(), // Approximate
+            bytes_read: bytes_counter.load(std::sync::atomic::Ordering::SeqCst),
             memory_stats: memory_tracker.stats(),
             buffer_size: self.streaming_config.buffer_size,
         };
@@ -655,7 +1030,7 @@ impl PackIngestor {
             .with_pack_size(pack_size.unwrap_or(0));
 
         // Create streaming reader with memory management
-        let mut streaming_reader = StreamingPackReader::new(input, self.streaming_config.clone());
+        let streaming_reader = StreamingPackReader::new(input, self.streaming_config.clone());
         let memory_tracker = streaming_reader.memory_tracker();
 
         // Ensure pack directory exists
@@ -677,6 +1052,8 @@ impl PackIngestor {
 
         // First, write the pack using streaming reader
         let streaming_wrapper = StreamingBufReader::new(streaming_reader, buffer_pool.clone());
+        // Counting counter to measure exact bytes read by gix-pack writer
+        let bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         
         let should_interrupt = AtomicBool::new(false);
         let write_opts = WriteOptions {
@@ -684,37 +1061,40 @@ impl PackIngestor {
         };
         
         let mut write_progress = progress.add_child("write pack".to_string());
-        let _write_outcome = match &thin_pack_lookup {
-            Some(handle) => gix_pack::Bundle::write_to_directory(
-                streaming_wrapper,
-                Some(pack_dir.as_path()),
-                &mut write_progress,
-                &should_interrupt,
-                Some(handle.clone()),
-                write_opts,
-            )
-            .map_err(|e| {
-                PackIngestionError::pack_parsing(
-                    "failed to write pack bundle with thin pack support (streaming)",
-                    context.clone().with_elapsed(start_time.elapsed()),
-                    Some(Box::new(e)),
+        let _write_outcome = {
+            let mut counting_reader = CountingReader { inner: streaming_wrapper, counter: bytes_counter.clone() };
+            match &thin_pack_lookup {
+                Some(handle) => gix_pack::Bundle::write_to_directory(
+                    &mut counting_reader,
+                    Some(pack_dir.as_path()),
+                    &mut write_progress,
+                    &should_interrupt,
+                    Some(handle.clone()),
+                    write_opts,
                 )
-            })?,
-            None => gix_pack::Bundle::write_to_directory(
-                streaming_wrapper,
-                Some(pack_dir.as_path()),
-                &mut write_progress,
-                &should_interrupt,
-                Option::<gix_odb::Handle>::None,
-                write_opts,
-            )
-            .map_err(|e| {
-                PackIngestionError::pack_parsing(
-                    "failed to write pack bundle (streaming)",
-                    context.clone().with_elapsed(start_time.elapsed()),
-                    Some(Box::new(e)),
+                .map_err(|e| {
+                    PackIngestionError::pack_parsing(
+                        "failed to write pack bundle with thin pack support (streaming)",
+                        context.clone().with_elapsed(start_time.elapsed()),
+                        Some(Box::new(e)),
+                    )
+                })?,
+                None => gix_pack::Bundle::write_to_directory(
+                    &mut counting_reader,
+                    Some(pack_dir.as_path()),
+                    &mut write_progress,
+                    &should_interrupt,
+                    Option::<gix_odb::Handle>::None,
+                    write_opts,
                 )
-            })?,
+                .map_err(|e| {
+                    PackIngestionError::pack_parsing(
+                        "failed to write pack bundle (streaming)",
+                        context.clone().with_elapsed(start_time.elapsed()),
+                        Some(Box::new(e)),
+                    )
+                })?,
+            }
         };
 
         // Find the freshly written .pack file
@@ -730,7 +1110,7 @@ impl PackIngestor {
                 }
             }
         }
-        let pack_path = pack_path.ok_or_else(|| {
+        let _pack_path = pack_path.ok_or_else(|| {
             PackIngestionError::unpack_objects_operation(
                 "failed to locate just-written pack file",
                 context.clone().with_elapsed(start_time.elapsed()),
@@ -740,13 +1120,13 @@ impl PackIngestor {
 
         // Get streaming statistics before cleanup
         let streaming_stats = StreamingStats {
-            bytes_read: memory_tracker.current_usage(),
+            bytes_read: bytes_counter.load(std::sync::atomic::Ordering::SeqCst),
             memory_stats: memory_tracker.stats(),
             buffer_size: self.streaming_config.buffer_size,
         };
 
         // Explode pack contents into loose objects with memory management
-        let mut explode_progress = progress.add_child("explode pack".to_string());
+        let _explode_progress = progress.add_child("explode pack".to_string());
         
         // For now, we'll use a placeholder for the actual explosion logic
         // In a full implementation, this would:
@@ -846,6 +1226,46 @@ impl PackIngestor {
             .with_context("reason", "progress and pack-streaming features not enabled");
         Err(PackIngestionError::configuration(
             "unpack-objects-streaming requires progress and pack-streaming features",
+            context,
+        ))
+    }
+}
+
+impl PackIngestionController {
+    /// Stub version of ingest_pack_with_fallback when progress feature is not enabled.
+    #[cfg(not(feature = "progress"))]
+    pub fn ingest_pack_with_fallback(
+        &self,
+        _input: &mut dyn std::io::BufRead,
+        _quarantine_objects_dir: &std::path::Path,
+        _pack_size: Option<u64>,
+        _object_count_hint: Option<u64>,
+        _thin_pack_lookup: Option<gix_odb::Handle>,
+        _progress: &mut dyn std::any::Any,
+    ) -> Result<PackIngestionResult> {
+        let context = ErrorContext::new("pack-ingestion-with-fallback")
+            .with_context("reason", "progress feature not enabled");
+        Err(PackIngestionError::configuration(
+            "pack ingestion with fallback requires progress feature",
+            context,
+        ))
+    }
+
+    /// Stub version of ingest_pack_streaming_with_fallback when required features are not enabled.
+    #[cfg(not(all(feature = "progress", feature = "pack-streaming")))]
+    pub fn ingest_pack_streaming_with_fallback(
+        &self,
+        _input: &mut dyn std::io::BufRead,
+        _quarantine_objects_dir: &std::path::Path,
+        _pack_size: Option<u64>,
+        _object_count_hint: Option<u64>,
+        _thin_pack_lookup: Option<gix_odb::Handle>,
+        _progress: &mut dyn std::any::Any,
+    ) -> Result<PackIngestionStreamingResult> {
+        let context = ErrorContext::new("pack-ingestion-streaming-with-fallback")
+            .with_context("reason", "progress and pack-streaming features not enabled");
+        Err(PackIngestionError::configuration(
+            "streaming pack ingestion with fallback requires progress and pack-streaming features",
             context,
         ))
     }
@@ -1040,13 +1460,117 @@ mod tests {
 
     #[test]
     fn policy_choose_path() {
-        let pol = IngestionPolicy { unpack_limit: Some(100) };
+        let pol = IngestionPolicy { unpack_limit: Some(100), enable_fallback: false };
         assert!(matches!(pol.choose_path(Some(50)), PackIngestPath::UnpackObjects));
         assert!(matches!(pol.choose_path(Some(150)), PackIngestPath::IndexPack));
         assert!(matches!(pol.choose_path(None), PackIngestPath::IndexPack));
 
-        let pol2 = IngestionPolicy { unpack_limit: None };
+        let pol2 = IngestionPolicy { unpack_limit: None, enable_fallback: false };
         assert!(matches!(pol2.choose_path(Some(1)), PackIngestPath::IndexPack));
+    }
+
+    #[test]
+    fn policy_fallback_strategies() {
+        let pol = IngestionPolicy::with_fallback(Some(100));
+        
+        // Test fallback availability
+        assert!(pol.has_fallback(PackIngestPath::IndexPack));
+        assert!(pol.has_fallback(PackIngestPath::UnpackObjects));
+        
+        // Test fallback strategy selection
+        assert_eq!(pol.get_fallback_strategy(PackIngestPath::IndexPack), Some(PackIngestPath::UnpackObjects));
+        assert_eq!(pol.get_fallback_strategy(PackIngestPath::UnpackObjects), Some(PackIngestPath::IndexPack));
+        
+        // Test strategy sequence
+        let sequence = pol.get_strategy_sequence(Some(50)); // Should prefer UnpackObjects
+        assert_eq!(sequence, vec![PackIngestPath::UnpackObjects, PackIngestPath::IndexPack]);
+        
+        let sequence = pol.get_strategy_sequence(Some(150)); // Should prefer IndexPack
+        assert_eq!(sequence, vec![PackIngestPath::IndexPack, PackIngestPath::UnpackObjects]);
+    }
+
+    #[test]
+    fn policy_no_fallback() {
+        let pol = IngestionPolicy::without_fallback(Some(100));
+        
+        // Test fallback disabled
+        assert!(!pol.has_fallback(PackIngestPath::IndexPack));
+        assert!(!pol.has_fallback(PackIngestPath::UnpackObjects));
+        
+        // Test no fallback strategy
+        assert_eq!(pol.get_fallback_strategy(PackIngestPath::IndexPack), None);
+        assert_eq!(pol.get_fallback_strategy(PackIngestPath::UnpackObjects), None);
+        
+        // Test strategy sequence with no fallback
+        let sequence = pol.get_strategy_sequence(Some(50));
+        assert_eq!(sequence, vec![PackIngestPath::UnpackObjects]);
+        
+        let sequence = pol.get_strategy_sequence(Some(150));
+        assert_eq!(sequence, vec![PackIngestPath::IndexPack]);
+    }
+
+    #[test]
+    fn pack_ingestion_controller_creation() {
+        let ingestor = PackIngestor::default();
+        let policy = IngestionPolicy::with_fallback(Some(100));
+        let controller = PackIngestionController::new(ingestor, policy);
+        
+        assert_eq!(controller.max_fallback_attempts, 2);
+        assert!(controller.policy().enable_fallback);
+        
+        let controller = controller.with_max_fallback_attempts(5);
+        assert_eq!(controller.max_fallback_attempts, 5);
+    }
+
+    #[test]
+    fn pack_ingestion_controller_should_attempt_fallback() {
+        let ingestor = PackIngestor::default();
+        let policy = IngestionPolicy::with_fallback(Some(100));
+        let controller = PackIngestionController::new(ingestor, policy);
+        
+        // Create a recoverable error
+        let recoverable_error = PackIngestionError::io(
+            "temporary failure",
+            ErrorContext::new("test"),
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "test"),
+        );
+        
+        // Should attempt fallback for recoverable error on first attempt
+        assert!(controller.should_attempt_fallback(&recoverable_error, 0, 0));
+        
+        // Should not attempt fallback if we've exceeded max attempts
+        assert!(!controller.should_attempt_fallback(&recoverable_error, 0, 2));
+        
+        // Should not attempt fallback if this is already a fallback attempt
+        assert!(!controller.should_attempt_fallback(&recoverable_error, 1, 0));
+        
+        // Create a non-recoverable error
+        let non_recoverable_error = PackIngestionError::object_validation(
+            "validation failed",
+            ErrorContext::new("test"),
+            None,
+            vec![],
+            None,
+        );
+        
+        // Should not attempt fallback for non-recoverable error
+        assert!(!controller.should_attempt_fallback(&non_recoverable_error, 0, 0));
+    }
+
+    #[test]
+    fn pack_ingestion_controller_no_fallback_policy() {
+        let ingestor = PackIngestor::default();
+        let policy = IngestionPolicy::without_fallback(Some(100));
+        let controller = PackIngestionController::new(ingestor, policy);
+        
+        let recoverable_error = PackIngestionError::io(
+            "temporary failure",
+            ErrorContext::new("test"),
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "test"),
+        );
+        
+        // Should not attempt fallback when policy disables it
+        assert!(!controller.should_attempt_fallback(&recoverable_error, 0, 0));
     }
 
     #[test]

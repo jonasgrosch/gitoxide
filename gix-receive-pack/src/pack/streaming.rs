@@ -226,8 +226,8 @@ impl<R: BufRead> StreamingPackReader<R> {
         self.buffer.clear();
         self.buffer.resize(self.config.buffer_size, 0);
 
-        // Read data
-        let bytes_read = match self.reader.read(&mut self.buffer) {
+        // Read data using BufRead interface
+        let bytes_read = match Read::read(&mut self.reader, &mut self.buffer) {
             Ok(0) => return Ok(None), // EOF
             Ok(n) => n,
             Err(e) => {
@@ -277,8 +277,8 @@ impl<R: BufRead> StreamingPackReader<R> {
         self.buffer.clear();
         self.buffer.resize(self.config.buffer_size, 0);
 
-        // Read data
-        let bytes_read = match self.reader.read(&mut self.buffer) {
+        // Read data using BufRead interface
+        let bytes_read = match Read::read(&mut self.reader, &mut self.buffer) {
             Ok(0) => return Ok(None), // EOF
             Ok(n) => n,
             Err(e) => {

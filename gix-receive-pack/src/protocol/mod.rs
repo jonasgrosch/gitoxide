@@ -1,6 +1,7 @@
  // M1: Protocol module surface (blocking-first). Async parity will be added behind feature flags.
 pub mod capabilities;
 pub mod advertise;
+pub mod config_integration;
 // M2: Options and commands parsing (blocking-first).
 pub mod options;
 pub mod commands;
@@ -26,5 +27,6 @@ pub type HiddenRefPredicate = dyn Fn(&RefRecord) -> bool + Send + Sync;
 /// Re-exports for crate users.
 pub use capabilities::{CapabilityOrdering, CapabilitySet};
 pub use advertise::Advertiser;
+pub use config_integration::{AdvertisementConfig, setup_advertiser_with_config};
 pub use options::Options;
 pub use commands::{CommandList, CommandUpdate};

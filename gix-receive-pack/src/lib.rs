@@ -102,10 +102,12 @@ pub mod pack;
 pub mod error;
 #[cfg(feature = "progress")]
 pub mod progress;
+pub mod interrupt;
 
 pub use protocol::{
     Advertiser, AdvertisementConfig, CapabilityOrdering, CapabilitySet, CommandList, CommandUpdate, HiddenRefPredicate, Options, RefRecord, setup_advertiser_with_config,
 };
+pub use interrupt::{CancellationFlag, CancellationPoint};
 
 use core::marker::PhantomData;
 use std::path::PathBuf;
@@ -502,10 +504,10 @@ impl ReceivePack {
         }
 
         match res {
-            Ok(fsck_results) => {
+            Ok(_fsck_results) => {
                 // Log fsck warnings if any
                 #[cfg(feature = "fsck")]
-                if !fsck_results.warnings.is_empty() {
+                if !_fsck_results.warnings.is_empty() {
                     // In a real implementation, we might want to log these warnings
                     // For now, we'll just continue
                 }
@@ -587,12 +589,12 @@ impl ReceivePack {
 
         // Create PackIngestor with streaming configuration
         #[cfg(feature = "fsck")]
-        let mut ingestor = crate::pack::PackIngestor::with_streaming_config(
+        let ingestor = crate::pack::PackIngestor::with_streaming_config(
             self.cfg.fsck_config.clone(),
             streaming_config,
         );
         #[cfg(not(feature = "fsck"))]
-        let mut ingestor = crate::pack::PackIngestor::with_streaming_config(None, streaming_config);
+        let ingestor = crate::pack::PackIngestor::with_streaming_config(None, streaming_config);
 
         let res = match choice {
             crate::pack::PackIngestPath::IndexPack => ingestor.index_pack_streaming(
@@ -626,10 +628,10 @@ impl ReceivePack {
         }
 
         match res {
-            Ok((fsck_results, streaming_stats)) => {
+            Ok((_fsck_results, _streaming_stats)) => {
                 // Log fsck warnings if any
                 #[cfg(feature = "fsck")]
-                if !fsck_results.warnings.is_empty() {
+                if !_fsck_results.warnings.is_empty() {
                     // In a real implementation, we might want to log these warnings
                     // For now, we'll just continue
                 }

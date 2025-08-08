@@ -1,4 +1,4 @@
-use std::io::{self, Write as _};
+use std::io;
 
 use super::{HiddenRefPredicate, RefRecord};
 use crate::protocol::capabilities::{CapabilityFormatter, CapabilityOrdering, CapabilitySet, IdiomaticFormatter};
@@ -7,6 +7,7 @@ use crate::protocol::capabilities::{CapabilityFormatter, CapabilityOrdering, Cap
 #[cfg(feature = "blocking-io")]
 mod blocking {
     use super::*;
+    use std::io::Write;
     use gix_packetline_blocking as pkt;
 
     /// Writes v0/v1-style advertisements for receive-pack (blocking).
