@@ -9,16 +9,33 @@ keywords = ["git", "receive-pack", "push", "protocol"]
 categories = ["development-tools", "network-programming"]
 
 [features]
-default = ["blocking"]
-blocking = []
-async = ["dep:tokio", "gix-transport/async-client", "gix-packetline/async-io"]
+# Align feature names with SPEC 3.1
+default = ["blocking-io"]
+
+# IO stacks (mutually exclusive by convention; not enforced here)
+# Forward our crate's blocking-io feature to dependencies that gate their blocking implementations.
+blocking-io = ["gix-packetline-blocking/blocking-io"]
+async-io = ["dep:tokio", "gix-transport/async-client", "gix-packetline/async-io"]
+
+# Cross-cutting features (scaffolded; wired into deps conservatively)
+parallel = ["dep:gix-features", "gix-features/parallel"]
+progress = ["dep:gix-features", "gix-features/progress"]
+hooks-external = ["dep:gix-command"]
+fsck = ["dep:gix-fsck"]
 strict-compat = []
+interrupt = []
+tracing = ["dep:gix-trace"]
+metrics = []
+serde = ["dep:serde"]
 
 [dependencies]
 thiserror = "1"
 
 # Async (guarded)
 tokio = { version = "1", default-features = false, features = ["io-util", "macros"], optional = true }
+
+# Optional serde for internal diagnostics/fixtures only
+serde = { version = "1", features = ["derive"], optional = true }
 
 # Core gitoxide crates (path-based; use minimal default-features for compile-time hygiene)
 gix-protocol = { path = "../gix-protocol", default-features = false }
@@ -29,14 +46,16 @@ gix-pack = { path = "../gix-pack", default-features = false }
 gix-odb = { path = "../gix-odb", default-features = false }
 gix-ref = { path = "../gix-ref", default-features = false }
 gix-shallow = { path = "../gix-shallow", default-features = false }
-gix-fsck = { path = "../gix-fsck", default-features = false }
+gix-fsck = { path = "../gix-fsck", default-features = false, optional = true }
 gix-object = { path = "../gix-object", default-features = false }
-gix-command = { path = "../gix-command", default-features = false }
+gix-command = { path = "../gix-command", default-features = false, optional = true }
 gix-worktree = { path = "../gix-worktree", default-features = false }
 gix-index = { path = "../gix-index", default-features = false }
 gix-diff = { path = "../gix-diff", default-features = false }
 gix-config = { path = "../gix-config", default-features = false }
 gix-hash = { path = "../gix-hash", default-features = false }
+gix-features = { path = "../gix-features", default-features = false, optional = true }
+gix-trace = { path = "../gix-trace", default-features = false, optional = true }
 
 [dev-dependencies]
 anyhow = "1"
