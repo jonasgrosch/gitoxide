@@ -15,6 +15,84 @@ Design principles
 - Zero I/O in constructors and configuration APIs.
 - Typestate to prevent invalid API usage at compile time.
 - Keep the core types minimal yet extensible.
+
+# Configuration Integration Examples
+
+This crate provides a clean separation between configuration parsing (done by higher layers)
+and protocol implementation. Here are examples of how higher layers inject configuration:
+
+## Basic Advertisement with Configuration
+
+```rust
+use gix_receive_pack::protocol::{AdvertisementConfig, setup_advertiser_with_config, RefRecord};
+use gix_hash::ObjectId;
+use std::io::Cursor;
+
+// Higher layer parses git configuration and creates AdvertisementConfig
+let config = AdvertisementConfig::modern_defaults()
+    .with_agent(Some("my-git-server/1.0".to_string()))
+    .with_atomic(true); // Maps from receive.advertiseAtomic
+
+// Convert configuration to capability set
+let caps = config.clone().into();
+
+// Set up advertiser with configuration
+let mut output = Vec::new();
+let mut advertiser = setup_advertiser_with_config(&mut output, config);
+
+// Create refs to advertise (from repository)
+let refs = vec![
+    RefRecord::new(
+        ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap(),
+        "refs/heads/main"
+    ),
+];
+
+// Write advertisement
+advertiser.write_advertisement(&refs, &caps, None).unwrap();
+```
+
+## Configuration Mapping from Git Config
+
+```rust
+use gix_receive_pack::protocol::AdvertisementConfig;
+
+// Example of how higher layers might map git configuration
+fn map_git_config_to_advertisement(
+    advertise_atomic: bool,
+    agent_string: Option<String>,
+    hide_agent: bool
+) -> AdvertisementConfig {
+    let mut config = AdvertisementConfig::modern_defaults();
+    
+    // Map receive.advertiseAtomic → atomic capability
+    if advertise_atomic {
+        config = config.with_atomic(true);
+    }
+    
+    // Map agent configuration
+    if hide_agent {
+        config = config.with_agent(None);
+    } else if let Some(agent) = agent_string {
+        config = config.with_agent(Some(agent));
+    }
+    
+    config
+}
+```
+
+## Enterprise Server Configuration
+
+```rust
+use gix_receive_pack::protocol::AdvertisementConfig;
+
+// Example enterprise configuration with multiple capabilities
+let enterprise_config = AdvertisementConfig::modern_defaults()
+    .with_agent(Some("enterprise-git/2.1".to_string()))
+    .with_atomic(true)
+    .push_extra_capability("push-options")
+    .push_extra_capability("no-thin");
+```
 */
 
 #![forbid(unsafe_code)]
@@ -26,7 +104,7 @@ pub mod error;
 pub mod progress;
 
 pub use protocol::{
-    Advertiser, CapabilityOrdering, CapabilitySet, CommandList, CommandUpdate, HiddenRefPredicate, Options, RefRecord,
+    Advertiser, AdvertisementConfig, CapabilityOrdering, CapabilitySet, CommandList, CommandUpdate, HiddenRefPredicate, Options, RefRecord, setup_advertiser_with_config,
 };
 
 use core::marker::PhantomData;
@@ -308,6 +386,7 @@ impl ReceivePack {
     pub fn ingest_pack(&self, object_count_hint: Option<u64>) -> Result<(), Error> {
         let policy = crate::pack::IngestionPolicy {
             unpack_limit: self.cfg.unpack_limit,
+            enable_fallback: true, // Enable fallback by default
         };
         let _path = policy.choose_path(object_count_hint);
 
@@ -376,6 +455,7 @@ impl ReceivePack {
             .ok_or_else(|| Error::Validation("objects_dir not configured".into()))?;
         let policy = crate::pack::IngestionPolicy {
             unpack_limit: self.cfg.unpack_limit,
+            enable_fallback: true, // Enable fallback by default
         };
         let choice = policy.choose_path(object_count_hint);
 
@@ -435,7 +515,7 @@ impl ReceivePack {
             }
             Err(e) => {
                 let _ = quarantine.drop_on_failure();
-                Err(e)
+                Err(e.into())
             }
         }
     }
@@ -470,7 +550,7 @@ impl ReceivePack {
     ///
     /// This method provides streaming pack ingestion with memory management controls,
     /// ensuring bounded memory usage regardless of pack size.
-    #[cfg(feature = "progress")]
+    #[cfg(all(feature = "pack-streaming", feature = "progress"))]
     pub fn ingest_pack_streaming<R: std::io::BufRead>(
         &self,
         input: &mut R,
@@ -496,6 +576,7 @@ impl ReceivePack {
             .ok_or_else(|| Error::Validation("objects_dir not configured".into()))?;
         let policy = crate::pack::IngestionPolicy {
             unpack_limit: self.cfg.unpack_limit,
+            enable_fallback: true, // Enable fallback by default
         };
         let choice = policy.choose_path(object_count_hint);
 
@@ -566,7 +647,7 @@ impl ReceivePack {
     /// M3: Streaming pack ingestion with sideband progress bridge and memory management.
     ///
     /// This combines streaming ingestion with sideband progress reporting and bounded memory usage.
-    #[cfg(feature = "progress")]
+    #[cfg(all(feature = "pack-streaming", feature = "progress"))]
     pub fn ingest_pack_streaming_with_sideband<R: std::io::BufRead, W: std::io::Write + std::marker::Send + 'static>(
         &self,
         input: &mut R,
@@ -587,6 +668,33 @@ impl ReceivePack {
         }
         // Use the streaming ingestion logic with bridged progress.
         self.ingest_pack_streaming(input, pack_size, object_count_hint, streaming_config, &mut bridge)
+    }
+
+    // Streaming stubs when pack-streaming is enabled but progress is not.
+    // This decouples the features while keeping a consistent API surface.
+    #[cfg(all(feature = "pack-streaming", not(feature = "progress")))]
+    pub fn ingest_pack_streaming<R: std::io::BufRead>(
+        &self,
+        _input: &mut R,
+        _pack_size: Option<u64>,
+        _object_count_hint: Option<u64>,
+        _streaming_config: crate::pack::StreamingConfig,
+        _progress: &mut dyn std::any::Any,
+    ) -> Result<crate::pack::StreamingStats, Error> {
+        Err(Error::Unimplemented)
+    }
+
+    #[cfg(all(feature = "pack-streaming", not(feature = "progress")))]
+    pub fn ingest_pack_streaming_with_sideband<R: std::io::BufRead, W: std::io::Write + std::marker::Send + 'static>(
+        &self,
+        _input: &mut R,
+        _pack_size: Option<u64>,
+        _object_count_hint: Option<u64>,
+        _streaming_config: crate::pack::StreamingConfig,
+        _inner_progress: Box<dyn std::any::Any>,
+        _sideband: W,
+    ) -> Result<crate::pack::StreamingStats, Error> {
+        Err(Error::Unimplemented)
     }
 
     /// Non-progress build: not available.

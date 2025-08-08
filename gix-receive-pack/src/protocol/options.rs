@@ -171,6 +171,18 @@ mod tests {
         gix_hash::ObjectId::from_hex(hex40.as_bytes()).expect("valid hex")
     }
 
+    #[test]
+    fn validate_rejects_agent_with_spaces() {
+        let adv = CapabilitySet::modern_defaults().with_agent(Some("gix/1.0".into()));
+        // Create an Options with a manually constructed agent token that contains spaces
+        let mut opts = Options::default();
+        opts.negotiated.push("agent=gix with spaces".to_string());
+        let err = opts.validate_against(&adv).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        let err_msg = format!("{err}");
+        assert!(err_msg.contains("must not contain spaces"));
+    }
+
     // Quick sanity to ensure advertised token building includes keys for key=value items.
     #[test]
     fn advertised_token_set_includes_keys() {

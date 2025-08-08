@@ -295,4 +295,27 @@ mod tests {
             other => panic!("expected Protocol, got {other:?}"),
         }
     }
+
+    #[test]
+    fn extra_tokens_after_refname_is_protocol_error() {
+        let text = "0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main extra-token\n";
+        let err = CommandList::parse_from_text(text).unwrap_err();
+        match err {
+            Error::Protocol(_) => {}
+            other => panic!("expected Protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shallow_invalid_oid_is_protocol_error() {
+        let text = concat!(
+            "0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\n",
+            "shallow zzzz000000000000000000000000000000000000\n",
+        );
+        let err = CommandList::parse_from_text(text).unwrap_err();
+        match err {
+            Error::Protocol(_) => {}
+            other => panic!("expected Protocol, got {other:?}"),
+        }
+    }
 }
