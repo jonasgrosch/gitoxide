@@ -107,6 +107,14 @@ impl CommandList {
                 continue;
             }
 
+            // unshallow support
+            if let Some(rest) = line.strip_prefix("unshallow ") {
+                let oid = parse_oid(rest)
+                    .map_err(|e| Error::Protocol(format!("invalid unshallow oid '{}': {}", rest, e)))?;
+                opts.add_unshallow_oid(oid);
+                continue;
+            }
+
             // Command line possibly with capabilities after NUL
             let (cmd_part, caps_part) = split_once_nul(line);
 
@@ -317,5 +325,16 @@ mod tests {
             Error::Protocol(_) => {}
             other => panic!("expected Protocol, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unshallow_parsing_and_validation() {
+        let text = concat!(
+            "0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\n",
+            "unshallow 4444444444444444444444444444444444444444\n",
+        );
+        let (_list, opts) = CommandList::parse_from_text(text).unwrap();
+        assert_eq!(opts.unshallow.len(), 1);
+        assert_eq!(opts.unshallow[0], oid("4444444444444444444444444444444444444444"));
     }
 }

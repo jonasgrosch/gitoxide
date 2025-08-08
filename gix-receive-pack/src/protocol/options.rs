@@ -11,7 +11,7 @@ use crate::protocol::capabilities::{CapabilityOrdering, CapabilitySet};
 /// Parsed options negotiated during head-info parsing.
 ///
 /// Contains a subset of tokens negotiated by the client (capabilities),
-/// push-options lines and shallow OIDs.
+/// push-options lines and shallow/unshallow OIDs.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Options {
     /// Space-separated capability tokens as negotiated from the first command line after the `\0`.
@@ -22,6 +22,8 @@ pub struct Options {
     pub push_options: Vec<String>,
     /// OIDs from `shallow <oid>` lines.
     pub shallow: Vec<ObjectId>,
+    /// OIDs from `unshallow <oid>` lines.
+    pub unshallow: Vec<ObjectId>,
 }
 
 impl Options {
@@ -45,6 +47,11 @@ impl Options {
     /// Add a shallow OID parsed from a `shallow <oid>` line.
     pub fn add_shallow_oid(&mut self, oid: ObjectId) {
         self.shallow.push(oid);
+    }
+
+    /// Add an unshallow OID parsed from an `unshallow <oid>` line.
+    pub fn add_unshallow_oid(&mut self, oid: ObjectId) {
+        self.unshallow.push(oid);
     }
 
     /// Check if a capability token was negotiated.
@@ -165,6 +172,16 @@ mod tests {
         assert_eq!(opts.push_options, vec!["ci-skip=true", "notify=team"]);
         assert_eq!(opts.shallow.len(), 1);
         assert_eq!(opts.shallow[0], oid);
+    }
+
+    #[test]
+    fn add_unshallow() {
+        let mut opts = Options::default();
+        let o1 = oid("2222222222222222222222222222222222222222");
+        let o2 = oid("3333333333333333333333333333333333333333");
+        opts.add_unshallow_oid(o1);
+        opts.add_unshallow_oid(o2);
+        assert_eq!(opts.unshallow, vec![o1, o2]);
     }
 
     fn oid(hex40: &str) -> gix_hash::ObjectId {

@@ -9,6 +9,8 @@ use std::path::Path;
 use gix_hash::ObjectId;
 use gix_object::Kind;
 
+#[cfg(feature = "fsck")]
+use gix_object::Find;
 // Error handling integration will be added when fsck validation is implemented
 
 /// Configuration for fsck validation during pack ingestion.

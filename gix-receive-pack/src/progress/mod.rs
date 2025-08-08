@@ -252,7 +252,7 @@ impl<W: Write + Send> gix_features::progress::NestedProgress for SidebandDynProg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gix_features::progress::{Discard, DynNestedProgress};
+    use gix_features::progress::DynNestedProgress;
 
     // A minimal inner progress that supports DynNestedProgress via Discard root.
     struct DummyDyn;
@@ -260,7 +260,7 @@ mod tests {
         fn set(&self, _step: Step) {}
         fn step(&self) -> Step { 0 }
         fn inc_by(&self, _step: Step) {}
-        fn counter(&self) -> gix_features::progress::StepShared { gix_features::progress::AtomicStep::default().share() }
+        fn counter(&self) -> gix_features::progress::StepShared { gix_features::progress::StepShared::default() }
     }
     impl Progress for DummyDyn {
         fn init(&mut self, _max: Option<Step>, _unit: Option<Unit>) {}

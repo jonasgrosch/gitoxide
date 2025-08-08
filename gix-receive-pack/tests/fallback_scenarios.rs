@@ -182,6 +182,12 @@ fn test_pack_ingestion_streaming_result_structure() {
         streaming_stats: StreamingStats {
             bytes_read: 1024,
             memory_stats: MemoryStats {
+                // Primary fields expected by MemoryStats
+                current_bytes: 256,
+                peak_bytes: 512,
+                max_bytes: None,
+                pressure_ratio: 0.0,
+                // Compatibility alias fields used by some tests
                 peak_usage: 512,
                 current_usage: 256,
                 allocations: 10,
