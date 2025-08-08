@@ -21,6 +21,8 @@ Design principles
 
 pub mod protocol;
 pub mod pack;
+#[cfg(feature = "progress")]
+pub mod progress;
 
 pub use protocol::{
     Advertiser, CapabilityOrdering, CapabilitySet, CommandList, CommandUpdate, HiddenRefPredicate, Options, RefRecord,
@@ -68,6 +70,15 @@ pub enum Error {
     /// I/O errors from filesystem or OS interactions.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Resource related errors like timeouts or size limits exceeded.
+    #[error("resource error: {0}")]
+    Resource(String),
+    /// Operation was cancelled/interrupted.
+    #[error("cancelled")]
+    Cancelled,
+    /// Fsck verification failed.
+    #[error("fsck failed: {0}")]
+    Fsck(String),
 }
 
 impl Error {
@@ -78,6 +89,9 @@ impl Error {
             Error::Protocol(_) => Kind::Protocol,
             Error::Validation(_) => Kind::Validation,
             Error::Io(_) => Kind::Io,
+            Error::Resource(_) => Kind::Resource,
+            Error::Cancelled => Kind::Cancelled,
+            Error::Fsck(_) => Kind::Validation,
         }
     }
 }
@@ -91,11 +105,15 @@ struct Config {
     mode: Mode,
     unpack_limit: Option<u64>,
     #[cfg(feature = "fsck")]
-    fsck_objects: bool,
+    fsck_config: Option<crate::pack::FsckConfig>,
     #[cfg(feature = "progress")]
     show_progress: bool,
     /// Path to the main repository objects directory (.git/objects)
     objects_dir: Option<PathBuf>,
+    /// Hard upper bound for allowed incoming pack size (bytes). None = unlimited.
+    max_pack_bytes: Option<u64>,
+    /// Soft time budget for ingestion (seconds). None = unlimited.
+    time_budget_secs: Option<u64>,
 }
 
 /// Execution mode for receive-pack.
@@ -157,10 +175,21 @@ impl ReceivePackBuilder<state::Ready> {
         self
     }
 
-    /// Enable or disable fsck verification on received objects (receive.fsckObjects).
+    /// Configure fsck verification on received objects (receive.fsckObjects).
+    #[cfg(feature = "fsck")]
+    pub fn with_fsck_config(mut self, config: crate::pack::FsckConfig) -> Self {
+        self.cfg.fsck_config = Some(config);
+        self
+    }
+
+    /// Enable fsck verification with default configuration.
     #[cfg(feature = "fsck")]
     pub fn with_fsck_objects(mut self, enabled: bool) -> Self {
-        self.cfg.fsck_objects = enabled;
+        if enabled {
+            self.cfg.fsck_config = Some(crate::pack::FsckConfig::default());
+        } else {
+            self.cfg.fsck_config = None;
+        }
         self
     }
 
@@ -174,6 +203,18 @@ impl ReceivePackBuilder<state::Ready> {
     /// Set the main repository objects directory (.git/objects) for ingestion and quarantine alternates.
     pub fn with_objects_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.cfg.objects_dir = Some(path.into());
+        self
+    }
+
+    /// Set maximum allowed pack size (in bytes). None = unlimited.
+    pub fn with_max_pack_bytes(mut self, v: impl Into<Option<u64>>) -> Self {
+        self.cfg.max_pack_bytes = v.into();
+        self
+    }
+
+    /// Set ingestion time budget in seconds. None = unlimited.
+    pub fn with_time_budget_secs(mut self, v: impl Into<Option<u64>>) -> Self {
+        self.cfg.time_budget_secs = v.into();
         self
     }
 
@@ -238,15 +279,15 @@ impl ReceivePack {
                 let _ = crate::pack::PackIngestor::index_pack_stub();
             }
             crate::pack::PackIngestPath::UnpackObjects => {
-                let _ = crate::pack::PackIngestor::unpack_objects_stub();
+                // Placeholder for unpack-objects - this is now handled in the full implementation
             }
         }
 
         // Optional fsck (scaffold)
         #[cfg(feature = "fsck")]
         {
-            if self.cfg.fsck_objects {
-                // Placeholder for fsck integration.
+            if self.cfg.fsck_config.is_some() {
+                // Fsck integration is now handled in PackIngestor
             }
         }
 
@@ -269,8 +310,18 @@ impl ReceivePack {
         input: &mut R,
         pack_size: Option<u64>,
         object_count_hint: Option<u64>,
-        progress: &mut dyn gix_features::progress::prodash::DynNestedProgress,
+        progress: &mut dyn gix_features::progress::DynNestedProgress,
     ) -> Result<(), Error> {
+        // Guards: size limit
+        if let (Some(limit), Some(sz)) = (self.cfg.max_pack_bytes, pack_size) {
+            if sz > limit {
+                return Err(Error::Resource(format!("incoming pack exceeds size limit: {sz} > {limit}")));
+            }
+        }
+
+        // Prepare time guard
+        let start = std::time::Instant::now();
+
         let objects_dir = self
             .cfg
             .objects_dir
@@ -286,8 +337,14 @@ impl ReceivePack {
         let mut quarantine = crate::pack::Quarantine::new(objects_dir.clone());
         quarantine.activate()?;
 
+        // Create PackIngestor with fsck configuration
+        #[cfg(feature = "fsck")]
+        let ingestor = crate::pack::PackIngestor::new(self.cfg.fsck_config.clone());
+        #[cfg(not(feature = "fsck"))]
+        let ingestor = crate::pack::PackIngestor::new(None);
+
         let res = match choice {
-            crate::pack::PackIngestPath::IndexPack => crate::pack::PackIngestor::index_pack(
+            crate::pack::PackIngestPath::IndexPack => ingestor.index_pack(
                 input,
                 quarantine.objects_dir.as_path(),
                 pack_size,
@@ -295,8 +352,7 @@ impl ReceivePack {
                 progress,
             ),
             crate::pack::PackIngestPath::UnpackObjects => {
-                // For now, route to index-pack as a safe default until unpack-objects is fully implemented.
-                crate::pack::PackIngestor::index_pack(
+                ingestor.unpack_objects(
                     input,
                     quarantine.objects_dir.as_path(),
                     pack_size,
@@ -306,8 +362,27 @@ impl ReceivePack {
             }
         };
 
+        // Time guard check
+        if let Some(budget) = self.cfg.time_budget_secs {
+            if start.elapsed().as_secs() > budget {
+                let _ = quarantine.drop_on_failure();
+                return Err(Error::Resource(format!(
+                    "ingestion exceeded time budget: {}s > {}s",
+                    start.elapsed().as_secs(),
+                    budget
+                )));
+            }
+        }
+
         match res {
-            Ok(_) => {
+            Ok(fsck_results) => {
+                // Log fsck warnings if any
+                #[cfg(feature = "fsck")]
+                if !fsck_results.warnings.is_empty() {
+                    // In a real implementation, we might want to log these warnings
+                    // For now, we'll just continue
+                }
+
                 quarantine.migrate_on_success()?;
                 Ok(())
             }
@@ -316,6 +391,32 @@ impl ReceivePack {
                 Err(e)
             }
         }
+    }
+
+    /// M3: Blocking ingestion with sideband progress bridge.
+    ///
+    /// This variant wires pack ingestion progress to sideband channel 2 using SidebandProgressWriter.
+    /// It wraps the provided `inner_progress` with a bridge that mirrors progress messages to sideband.
+    #[cfg(feature = "progress")]
+    pub fn ingest_pack_from_reader_with_sideband<R: std::io::BufRead, W: std::io::Write + std::marker::Send + 'static>(
+        &self,
+        input: &mut R,
+        pack_size: Option<u64>,
+        object_count_hint: Option<u64>,
+        inner_progress: Box<dyn gix_features::progress::DynNestedProgress>,
+        sideband: W,
+    ) -> Result<(), Error> {
+        // Create a bridge that mirrors messages to sideband channel 2.
+        let mut bridge = crate::progress::SidebandDynProgress::new(inner_progress, sideband);
+        // Initial policy follows upstream: keepalive after NUL; callers may toggle to ALWAYS later.
+        {
+            let writer = bridge.writer();
+            if let Ok(mut w) = writer.lock() {
+                w.set_policy(crate::progress::KeepalivePolicy::AfterNul);
+            };
+        }
+        // Reuse the core ingestion logic with bridged progress.
+        self.ingest_pack_from_reader(input, pack_size, object_count_hint, &mut bridge)
     }
 
     /// Non-progress build: not available.
