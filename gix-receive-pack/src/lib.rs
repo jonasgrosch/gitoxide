@@ -466,6 +466,129 @@ impl ReceivePack {
         self.ingest_pack_from_reader(input, pack_size, object_count_hint, &mut bridge)
     }
 
+    /// M3: Streaming pack ingestion with bounded memory usage.
+    ///
+    /// This method provides streaming pack ingestion with memory management controls,
+    /// ensuring bounded memory usage regardless of pack size.
+    #[cfg(feature = "progress")]
+    pub fn ingest_pack_streaming<R: std::io::BufRead>(
+        &self,
+        input: &mut R,
+        pack_size: Option<u64>,
+        object_count_hint: Option<u64>,
+        streaming_config: crate::pack::StreamingConfig,
+        progress: &mut dyn gix_features::progress::DynNestedProgress,
+    ) -> Result<crate::pack::StreamingStats, Error> {
+        // Guards: size limit
+        if let (Some(limit), Some(sz)) = (self.cfg.max_pack_bytes, pack_size) {
+            if sz > limit {
+                return Err(Error::Resource(format!("incoming pack exceeds size limit: {sz} > {limit}")));
+            }
+        }
+
+        // Prepare time guard
+        let start = std::time::Instant::now();
+
+        let objects_dir = self
+            .cfg
+            .objects_dir
+            .clone()
+            .ok_or_else(|| Error::Validation("objects_dir not configured".into()))?;
+        let policy = crate::pack::IngestionPolicy {
+            unpack_limit: self.cfg.unpack_limit,
+        };
+        let choice = policy.choose_path(object_count_hint);
+
+        let main_odb = gix_odb::at(objects_dir.clone())?;
+
+        let mut quarantine = crate::pack::Quarantine::new(objects_dir.clone());
+        quarantine.activate()?;
+
+        // Create PackIngestor with streaming configuration
+        #[cfg(feature = "fsck")]
+        let mut ingestor = crate::pack::PackIngestor::with_streaming_config(
+            self.cfg.fsck_config.clone(),
+            streaming_config,
+        );
+        #[cfg(not(feature = "fsck"))]
+        let mut ingestor = crate::pack::PackIngestor::with_streaming_config(None, streaming_config);
+
+        let res = match choice {
+            crate::pack::PackIngestPath::IndexPack => ingestor.index_pack_streaming(
+                input,
+                quarantine.objects_dir.as_path(),
+                pack_size,
+                Some(main_odb.clone()),
+                progress,
+            ),
+            crate::pack::PackIngestPath::UnpackObjects => {
+                ingestor.unpack_objects_streaming(
+                    input,
+                    quarantine.objects_dir.as_path(),
+                    pack_size,
+                    Some(main_odb.clone()),
+                    progress,
+                )
+            }
+        };
+
+        // Time guard check
+        if let Some(budget) = self.cfg.time_budget_secs {
+            if start.elapsed().as_secs() > budget {
+                let _ = quarantine.drop_on_failure();
+                return Err(Error::Resource(format!(
+                    "ingestion exceeded time budget: {}s > {}s",
+                    start.elapsed().as_secs(),
+                    budget
+                )));
+            }
+        }
+
+        match res {
+            Ok((fsck_results, streaming_stats)) => {
+                // Log fsck warnings if any
+                #[cfg(feature = "fsck")]
+                if !fsck_results.warnings.is_empty() {
+                    // In a real implementation, we might want to log these warnings
+                    // For now, we'll just continue
+                }
+
+                quarantine.migrate_on_success()?;
+                Ok(streaming_stats)
+            }
+            Err(e) => {
+                let _ = quarantine.drop_on_failure();
+                Err(e.into())
+            }
+        }
+    }
+
+    /// M3: Streaming pack ingestion with sideband progress bridge and memory management.
+    ///
+    /// This combines streaming ingestion with sideband progress reporting and bounded memory usage.
+    #[cfg(feature = "progress")]
+    pub fn ingest_pack_streaming_with_sideband<R: std::io::BufRead, W: std::io::Write + std::marker::Send + 'static>(
+        &self,
+        input: &mut R,
+        pack_size: Option<u64>,
+        object_count_hint: Option<u64>,
+        streaming_config: crate::pack::StreamingConfig,
+        inner_progress: Box<dyn gix_features::progress::DynNestedProgress>,
+        sideband: W,
+    ) -> Result<crate::pack::StreamingStats, Error> {
+        // Create a bridge that mirrors messages to sideband channel 2.
+        let mut bridge = crate::progress::SidebandDynProgress::new(inner_progress, sideband);
+        // Initial policy follows upstream: keepalive after NUL; callers may toggle to ALWAYS later.
+        {
+            let writer = bridge.writer();
+            if let Ok(mut w) = writer.lock() {
+                w.set_policy(crate::progress::KeepalivePolicy::AfterNul);
+            };
+        }
+        // Use the streaming ingestion logic with bridged progress.
+        self.ingest_pack_streaming(input, pack_size, object_count_hint, streaming_config, &mut bridge)
+    }
+
     /// Non-progress build: not available.
     #[cfg(not(feature = "progress"))]
     pub fn ingest_pack_from_reader<R: std::io::BufRead>(
