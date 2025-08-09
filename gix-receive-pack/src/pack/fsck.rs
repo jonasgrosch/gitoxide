@@ -75,6 +75,23 @@ pub struct FsckResults {
     pub missing_objects: Vec<MissingObject>,
 }
 
+impl FsckResults {
+    /// Check if there are any errors in the fsck results.
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty() || !self.missing_objects.is_empty()
+    }
+
+    /// Check if there are any warnings in the fsck results.
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Get the total number of issues (errors + warnings).
+    pub fn issue_count(&self) -> usize {
+        self.errors.len() + self.warnings.len() + self.missing_objects.len()
+    }
+}
+
 /// A single fsck message (warning or error).
 #[derive(Debug, Clone)]
 pub struct FsckMessage {
